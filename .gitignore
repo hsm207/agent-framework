@@ -238,3 +238,7 @@ dotnet/filtered-*.slnx
 
 **/*.lscache
 *sync_report.md
+
+# .NET Build Artifacts
+**/obj/
+**/bin/
