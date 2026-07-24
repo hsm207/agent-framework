@@ -402,4 +402,12 @@ FodyWeavers.xsd
 *.msp
 
 # JetBrains Rider
-*.sln.iml*.lscache
+*.sln.iml
+*.lscache
+
+# Foundry agent CLI config (contains secrets, auto-generated)
+.foundry-agent.json
+.foundry-agent-build.log
+
+# Pre-published output for Docker builds
+out/

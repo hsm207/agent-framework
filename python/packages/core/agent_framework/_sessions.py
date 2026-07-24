@@ -8,27 +8,73 @@ This module provides the core types for the context provider pipeline:
 - HistoryProvider: Base class for history storage providers
 - AgentSession: Lightweight session state container
 - InMemoryHistoryProvider: Built-in in-memory history provider
+- FileHistoryProvider: Built-in JSON Lines file history provider
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import json
+import logging
+import threading
 import uuid
+import weakref
 from abc import abstractmethod
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard, cast
+from base64 import urlsafe_b64encode
+from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, TypeGuard, cast
 
+from ._feature_stage import ExperimentalFeature, experimental
 from ._middleware import ChatContext, ChatMiddleware
-from ._types import AgentResponse, ChatResponse, Message, ResponseStream
-from .exceptions import ChatClientInvalidResponseException
+from ._types import (
+    AgentResponse,
+    AgentRunInputs,
+    ChatResponse,
+    ChatResponseUpdate,
+    Message,
+    ResponseStream,
+    _build_agent_response_from_chat_response,  # pyright: ignore[reportPrivateUsage]
+    normalize_messages,
+)
+from .exceptions import ChatClientInvalidRequestException, ChatClientInvalidResponseException
 
 if TYPE_CHECKING:
     from ._agents import SupportsAgentRun
     from ._middleware import MiddlewareTypes
 
 
+logger = logging.getLogger("agent_framework")
+
 # Registry of known types for state deserialization
 _STATE_TYPE_REGISTRY: dict[str, type] = {}
+MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY: str = "message_injection.pending_messages"
+_MESSAGE_INJECTION_LOCK = threading.Lock()
+
+JsonDumps: TypeAlias = Callable[[Any], str | bytes]
+JsonLoads: TypeAlias = Callable[[str | bytes], Any]
+ServiceSessionId: TypeAlias = Mapping[str, Any]
+
+
+def _default_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _default_json_loads(value: str | bytes) -> Any:
+    return json.loads(value)
+
+
+def _deduplicate_origin_session_ids(origin_session_ids: Iterable[str]) -> list[str]:
+    """Return origin session IDs in first-seen order without duplicates."""
+    unique_origin_session_ids: list[str] = []
+    seen_origin_session_ids: set[str] = set()
+    for origin_session_id in origin_session_ids:
+        if origin_session_id not in seen_origin_session_ids:
+            seen_origin_session_ids.add(origin_session_id)
+            unique_origin_session_ids.append(origin_session_id)
+    return unique_origin_session_ids
 
 
 def _is_middleware_sequence(
@@ -73,9 +119,9 @@ _register_state_type = register_state_type
 def _serialize_value(value: Any) -> Any:
     """Serialize a single value, handling objects with to_dict() and Pydantic models."""
     if hasattr(value, "to_dict") and callable(value.to_dict):
-        return value.to_dict()  # pyright: ignore[reportUnknownMemberType]
+        return value.to_dict()
     # Pydantic BaseModel support — import lazily to avoid hard dep at module level
-    try:
+    with suppress(ImportError):
         from pydantic import BaseModel
 
         if isinstance(value, BaseModel):
@@ -85,8 +131,6 @@ def _serialize_value(value: Any) -> Any:
             # Auto-register for round-trip deserialization
             _STATE_TYPE_REGISTRY.setdefault(type_id, value.__class__)
             return data
-    except ImportError:
-        pass
     if isinstance(value, list):
         return [_serialize_value(item) for item in value]  # pyright: ignore[reportUnknownVariableType]
     if isinstance(value, dict):
@@ -103,14 +147,12 @@ def _deserialize_value(value: Any) -> Any:
             if hasattr(cls, "from_dict"):
                 return cls.from_dict(value)  # type: ignore[union-attr]
             # Pydantic BaseModel support
-            try:
+            with suppress(ImportError):
                 from pydantic import BaseModel
 
                 if issubclass(cls, BaseModel):
                     data: dict[str, Any] = {str(k): v for k, v in value.items() if k != "type"}  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
                     return cls.model_validate(data)
-            except ImportError:
-                pass
     if isinstance(value, list):
         return [_deserialize_value(item) for item in value]  # pyright: ignore[reportUnknownVariableType]
     if isinstance(value, dict):
@@ -140,7 +182,8 @@ class SessionContext:
 
     Attributes:
         session_id: The ID of the current session.
-        service_session_id: Service-managed session ID (if present, service handles storage).
+        service_session_id: Service-managed session identifier
+            (if present, the service stores history).
         input_messages: The new messages being sent to the agent (set by caller).
         context_messages: Dict mapping source_id -> messages added by that provider.
             Maintains insertion order (provider execution order).
@@ -157,7 +200,7 @@ class SessionContext:
         self,
         *,
         session_id: str | None = None,
-        service_session_id: str | None = None,
+        service_session_id: str | ServiceSessionId | None = None,
         input_messages: list[Message],
         context_messages: dict[str, list[Message]] | None = None,
         instructions: list[str] | None = None,
@@ -170,7 +213,7 @@ class SessionContext:
 
         Args:
             session_id: The ID of the current session.
-            service_session_id: Service-managed session ID.
+            service_session_id: Service-managed session identifier.
             input_messages: The new messages being sent to the agent.
             context_messages: Pre-populated context messages by source.
             instructions: Pre-populated instructions.
@@ -198,7 +241,13 @@ class SessionContext:
         """The agent's response. Set by the framework after invocation, read-only for providers."""
         return self._response
 
-    def extend_messages(self, source: str | object, messages: Sequence[Message]) -> None:
+    def extend_messages(
+        self,
+        source: str | object,
+        messages: Sequence[Message],
+        *,
+        origin_session_ids: Sequence[str] | None = None,
+    ) -> None:
         """Add context messages from a specific source.
 
         Messages are copied before attribution is added, so the caller's
@@ -213,19 +262,56 @@ class SessionContext:
                 object is passed, its class name is recorded as
                 ``source_type`` in the attribution.
             messages: The messages to add.
+
+        Keyword Args:
+            origin_session_ids: Optional session IDs that originally produced
+                these messages, when different from the current session. Set
+                by providers that inject content stored under other sessions
+                (cross-session memory). The IDs describe the contributing
+                sessions for every message supplied in this call; they are not
+                positionally paired with messages, and a composed message can
+                have multiple origins. The values are exposed under
+                ``additional_properties["_attribution"]["origin_session_ids"]``
+                so downstream context observers can detect cross-session
+                content for governance, audit, or behavioral-analysis
+                purposes. Omit (default) when content originates in the
+                current session; absence of the field means that no origin
+                information was supplied.
         """
         if isinstance(source, str):
             source_id = source
-            attribution: dict[str, str] = {"source_id": source_id}
+            attribution: dict[str, Any] = {"source_id": source_id}
         else:
             source_id = source.source_id  # type: ignore[attr-defined]
             attribution = {"source_id": source_id, "source_type": type(source).__name__}
+        if origin_session_ids:
+            attribution["origin_session_ids"] = _deduplicate_origin_session_ids(origin_session_ids)
 
         copied: list[Message] = []
         for message in messages:
             msg_copy = copy.copy(message)
             msg_copy.additional_properties = dict(message.additional_properties)
-            msg_copy.additional_properties.setdefault("_attribution", attribution)
+            message_attribution = dict(attribution)
+            if "origin_session_ids" in message_attribution:
+                message_attribution["origin_session_ids"] = list(message_attribution["origin_session_ids"])
+            existing_attribution = msg_copy.additional_properties.get("_attribution")
+            if isinstance(existing_attribution, Mapping):
+                merged_attribution = dict(cast(Mapping[str, Any], existing_attribution))
+                for key, value in message_attribution.items():
+                    if key == "origin_session_ids":
+                        existing_origins = merged_attribution.get(key)
+                        if isinstance(existing_origins, Sequence) and not isinstance(existing_origins, str):
+                            existing_origin_values = cast(Sequence[Any], existing_origins)
+                            value = _deduplicate_origin_session_ids(
+                                [origin for origin in existing_origin_values if isinstance(origin, str)]
+                                + cast(list[str], value)
+                            )
+                        merged_attribution[key] = value
+                    else:
+                        merged_attribution.setdefault(key, value)
+                msg_copy.additional_properties["_attribution"] = merged_attribution
+            else:
+                msg_copy.additional_properties.setdefault("_attribution", message_attribution)
             copied.append(msg_copy)
         if source_id not in self.context_messages:
             self.context_messages[source_id] = []
@@ -526,7 +612,7 @@ def is_local_history_conversation_id(conversation_id: str | None) -> bool:
 def _response_contains_follow_up_request(response: ChatResponse) -> bool:
     """Return whether a response requires another model call in the current run."""
     return any(
-        item.type in {"function_call", "function_approval_request"}
+        item.type == "function_approval_request" or (item.type == "function_call" and not item.informational_only)
         for message in response.messages
         for item in message.contents
     )
@@ -548,6 +634,160 @@ def _split_service_call_messages(messages: Sequence[Message]) -> tuple[list[Mess
     return input_messages, context_messages
 
 
+def enqueue_messages(session: AgentSession, messages: AgentRunInputs) -> None:
+    """Enqueue messages for the next model call in the given session.
+
+    Args:
+        session: The session whose pending message queue should receive the messages.
+        messages: The messages to enqueue. Accepts the same flexible shapes as ``Agent.run`` input:
+            a string, ``Content``, ``Message``, or a sequence of those.
+    """
+    pending_messages = normalize_messages(messages)
+    if not pending_messages:
+        return
+    with _MESSAGE_INJECTION_LOCK:
+        queue = cast(
+            list[Message],
+            session.state.setdefault(MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY, []),
+        )
+        queue.extend(pending_messages)
+
+
+class MessageInjectionMiddleware(ChatMiddleware):
+    """Chat middleware that injects queued session messages into the model call loop.
+
+    Messages can be enqueued for an :class:`AgentSession` before a run starts or while a run is in progress,
+    including from tool code that receives a :class:`FunctionInvocationContext`. Pending messages are stored in
+    ``session.state`` and drained into the next model call for that session. After a model call completes, the
+    middleware loops internally only when there are newly queued messages and the response does not contain function
+    calls that the function invocation layer must handle.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the middleware."""
+
+    def enqueue_messages(self, session: AgentSession, messages: AgentRunInputs) -> None:
+        """Enqueue messages for the next model call in the given session.
+
+        Args:
+            session: The session whose pending message queue should receive the messages.
+            messages: The messages to enqueue. Accepts the same flexible shapes as ``Agent.run`` input:
+                a string, ``Content``, ``Message``, or a sequence of those.
+        """
+        enqueue_messages(session, messages)
+
+    def get_pending_messages(self, session: AgentSession) -> list[Message]:
+        """Return a snapshot of messages queued for the given session.
+
+        Args:
+            session: The session whose pending messages should be returned.
+
+        Returns:
+            A point-in-time copy of the queued messages. The returned list is not updated if the queue is later
+            drained or extended.
+        """
+        with _MESSAGE_INJECTION_LOCK:
+            return list(cast(list[Message], session.state.get(MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY, [])))
+
+    def _drain_pending_messages(self, session: AgentSession, messages: Sequence[Message]) -> list[Message]:
+        with _MESSAGE_INJECTION_LOCK:
+            queue = cast(
+                list[Message],
+                session.state.setdefault(MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY, []),
+            )
+            if not queue:
+                return list(messages)
+            next_messages = [*messages, *queue]
+            queue.clear()
+            return next_messages
+
+    def _has_pending_messages(self, session: AgentSession) -> bool:
+        with _MESSAGE_INJECTION_LOCK:
+            return bool(session.state.get(MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY, []))
+
+    @staticmethod
+    def _update_context_conversation_id(context: ChatContext, conversation_id: str | None) -> None:
+        if conversation_id is None:
+            return
+        context.kwargs["conversation_id"] = conversation_id
+        if context.options is None:
+            context.options = {"conversation_id": conversation_id}
+            return
+        context.options = {**context.options, "conversation_id": conversation_id}
+
+    async def _process_non_streaming(
+        self,
+        context: ChatContext,
+        call_next: Callable[[], Awaitable[None]],
+        session: AgentSession,
+    ) -> None:
+        while True:
+            context.messages = self._drain_pending_messages(session, context.messages)
+            context.result = None
+            await call_next()
+            if context.result is None:
+                return
+            if isinstance(context.result, ResponseStream):
+                raise ValueError("Non-streaming message injection middleware requires a ChatResponse result.")
+            response = cast(ChatResponse, context.result)
+            if _response_contains_follow_up_request(response) or not self._has_pending_messages(session):
+                return
+            self._update_context_conversation_id(context, response.conversation_id)
+            empty_messages: list[Message] = []
+            context.messages = empty_messages
+
+    async def _stream_injected_messages(
+        self,
+        context: ChatContext,
+        call_next: Callable[[], Awaitable[None]],
+        session: AgentSession,
+    ) -> AsyncIterable[ChatResponseUpdate]:
+        while True:
+            context.messages = self._drain_pending_messages(session, context.messages)
+            context.result = None
+            await call_next()
+            if context.result is None:
+                return
+            if not isinstance(context.result, ResponseStream):
+                raise ValueError("Streaming message injection middleware requires a ResponseStream result.")
+            stream = cast(ResponseStream[ChatResponseUpdate, ChatResponse], context.result)
+            async for update in stream:
+                yield update
+            response = await stream.get_final_response()
+            if _response_contains_follow_up_request(response) or not self._has_pending_messages(session):
+                return
+            self._update_context_conversation_id(context, response.conversation_id)
+            empty_messages: list[Message] = []
+            context.messages = empty_messages
+
+    async def process(self, context: ChatContext, call_next: Callable[[], Awaitable[None]]) -> None:
+        """Inject pending session messages into chat model calls.
+
+        Args:
+            context: The chat invocation context for the current model call.
+            call_next: The next middleware or leaf chat client.
+
+        Raises:
+            ChatClientInvalidRequestException: If the middleware is used without an active ``AgentSession``.
+            ValueError: If downstream middleware returns a non-streaming result for streaming mode, or vice versa.
+        """
+        session = context.session
+        if session is None:
+            raise ChatClientInvalidRequestException(
+                "MessageInjectionMiddleware requires an AgentSession. Pass session=... when running the agent."
+            )
+
+        if not context.stream:
+            await self._process_non_streaming(context, call_next, session)
+            return
+
+        response_format = context.options.get("response_format") if context.options is not None else None
+        context.result = ResponseStream(
+            self._stream_injected_messages(context, call_next, session),
+            finalizer=lambda updates: ChatResponse.from_updates(updates, output_format_type=response_format),
+        )
+
+
 class PerServiceCallHistoryPersistingMiddleware(ChatMiddleware):
     """Persist local chat history after each service call when history is framework-managed.
 
@@ -564,6 +804,7 @@ class PerServiceCallHistoryPersistingMiddleware(ChatMiddleware):
         agent: SupportsAgentRun,
         session: AgentSession,
         providers: Sequence[HistoryProvider],
+        service_stores_history: bool = False,
     ) -> None:
         """Initialize the middleware.
 
@@ -571,10 +812,16 @@ class PerServiceCallHistoryPersistingMiddleware(ChatMiddleware):
             agent: The agent that owns the history providers.
             session: The active session for the current run.
             providers: The history providers participating in per-service-call persistence.
+            service_stores_history: When True, the chat client stores history server-side. The
+                middleware then skips loading providers and leaves the real conversation id
+                untouched, persisting each service call without driving the function loop with a
+                local sentinel. When False, the middleware loads providers and uses a local
+                sentinel conversation id so the function loop runs without service-side storage.
         """
         self._agent = agent
         self._session = session
         self._providers = list(providers)
+        self._service_stores_history = service_stores_history
 
     async def _prepare_service_call_context(self, messages: Sequence[Message]) -> SessionContext:
         """Create a per-call SessionContext and load history providers into it."""
@@ -586,6 +833,9 @@ class PerServiceCallHistoryPersistingMiddleware(ChatMiddleware):
         )
         for source_id, source_messages in context_messages.items():
             service_call_context.extend_messages(source_id, source_messages)
+        # When the service stores history, it owns loading; the providers are write-only sinks.
+        if self._service_stores_history:
+            return service_call_context
         for provider in self._providers:
             if not provider.load_messages:
                 continue
@@ -604,9 +854,9 @@ class PerServiceCallHistoryPersistingMiddleware(ChatMiddleware):
         response: ChatResponse,
     ) -> None:
         """Persist a single model-call response through the configured history providers."""
-        service_call_context._response = AgentResponse(  # type: ignore[assignment]
-            messages=response.messages,
-            response_id=None,
+        service_call_context._response = _build_agent_response_from_chat_response(  # type: ignore[assignment]
+            response,
+            suppress_response_id=True,
         )
         for provider in reversed(self._providers):
             await provider.after_run(
@@ -636,17 +886,35 @@ class PerServiceCallHistoryPersistingMiddleware(ChatMiddleware):
         response: ChatResponse,
     ) -> ChatResponse:
         """Persist a model response and apply the local follow-up sentinel when needed."""
-        if response.conversation_id is not None and not is_local_history_conversation_id(response.conversation_id):
+        if (
+            not self._service_stores_history
+            and response.conversation_id is not None
+            and not is_local_history_conversation_id(response.conversation_id)
+        ):
             raise ChatClientInvalidResponseException(
                 "require_per_service_call_history_persistence cannot be used "
                 "when the chat client returns a real conversation_id."
+            )
+
+        # In storing mode the service is expected to echo a conversation id that the next run
+        # resumes from. If it comes back empty, the provider still captures this turn but there is
+        # no service id to load from next time, so cross-turn history can be lost silently. Warn
+        # every time so this uncommon, easy-to-miss failure mode cannot fail quietly.
+        if self._service_stores_history and response.conversation_id is None:
+            logger.warning(
+                "require_per_service_call_history_persistence is enabled with a chat client that "
+                "stores history server-side, but the client returned no conversation_id; cross-turn "
+                "history may not resume. Set store=False to load and resume from the HistoryProvider "
+                "instead."
             )
 
         await self._persist_service_call_response(
             service_call_context=service_call_context,
             response=response,
         )
-        if _response_contains_follow_up_request(response):
+        # The local sentinel only applies when the service does not store history; when it does,
+        # the real conversation id already drives function-loop continuation.
+        if not self._service_stores_history and _response_contains_follow_up_request(response):
             response.mark_internal_conversation_id()
             response.conversation_id = LOCAL_HISTORY_CONVERSATION_ID
         return response
@@ -665,8 +933,12 @@ class PerServiceCallHistoryPersistingMiddleware(ChatMiddleware):
                 result type for streaming or non-streaming execution.
         """
         service_call_context = await self._prepare_service_call_context(context.messages)
-        context.messages = service_call_context.get_messages(include_input=True)
-        self._strip_local_conversation_id(context)
+        # When the service stores history, leave the outgoing messages and the real conversation
+        # id untouched (pass-through); the middleware only persists. Otherwise reconstruct the
+        # outgoing messages from the loaded local history and strip the local sentinel.
+        if not self._service_stores_history:
+            context.messages = service_call_context.get_messages(include_input=True)
+            self._strip_local_conversation_id(context)
 
         await call_next()
 
@@ -698,9 +970,16 @@ class AgentSession:
     Lightweight state container. Provider instances are owned by the agent,
     not the session. The session only holds session IDs and a mutable state dict.
 
+    ``service_session_id`` can contain a provider-issued service session
+    identifier, such as a service conversation ID or response ID. Treat this
+    value as trusted application state: it is scoped by the backing API key,
+    service account, or project, but it is not an end-user authorization
+    boundary by itself.
+
     Attributes:
         session_id: Unique identifier for this session.
-        service_session_id: Service-managed session ID (if using service-side storage).
+        service_session_id: Service-managed session identifier
+            (if using service-side storage).
         state: Mutable state dict shared with all providers.
     """
 
@@ -708,13 +987,13 @@ class AgentSession:
         self,
         *,
         session_id: str | None = None,
-        service_session_id: str | None = None,
+        service_session_id: str | ServiceSessionId | None = None,
     ):
         """Initialize the session.
 
         Args:
             session_id: Optional session ID (generated if not provided).
-            service_session_id: Optional service-managed session ID.
+            service_session_id: Optional service-managed session identifier.
         """
         self._session_id = session_id or str(uuid.uuid4())
         self.service_session_id = service_session_id
@@ -837,3 +1116,247 @@ class InMemoryHistoryProvider(HistoryProvider):
             return
         existing = state.get("messages", [])
         state["messages"] = [*existing, *messages]
+
+
+@experimental(feature_id=ExperimentalFeature.FILE_HISTORY)
+class FileHistoryProvider(HistoryProvider):
+    """File-backed history provider that stores one JSON Lines file per session.
+
+    Each persisted message is written as a single JSON object per line. The
+    provider does not serialize full session snapshots into the file. By default
+    it uses the standard library ``json`` module, but callers can inject
+    alternative ``dumps`` and ``loads`` callables compatible with the JSON
+    Lines format.
+
+    Security posture:
+        Persisted history is stored as plaintext JSONL on the local filesystem.
+        Treat ``storage_path`` as trusted application storage, not as a secret
+        store. Encoded fallback filenames and resolved-path validation help
+        prevent path traversal via ``session_id``, but they do not encrypt file
+        contents or provide cross-process / cross-host locking. Use OS-level
+        file permissions, trusted directories, and carefully review what agent
+        or tool output is allowed to be persisted.
+    """
+
+    DEFAULT_SOURCE_ID: ClassVar[str] = "file_history"
+    DEFAULT_SESSION_FILE_STEM: ClassVar[str] = "default"
+    FILE_EXTENSION: ClassVar[str] = ".jsonl"
+    _FILE_LOCK_STRIPE_COUNT: ClassVar[int] = 64
+    _ENCODED_SESSION_PREFIX: ClassVar[str] = "~session-"
+    _FILE_WRITE_LOCKS: ClassVar[tuple[threading.Lock, ...]] = tuple(
+        threading.Lock() for _ in range(_FILE_LOCK_STRIPE_COUNT)
+    )
+    _WINDOWS_RESERVED_FILE_STEMS: ClassVar[frozenset[str]] = frozenset({
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+    })
+
+    def __init__(
+        self,
+        storage_path: str | Path,
+        *,
+        source_id: str = DEFAULT_SOURCE_ID,
+        load_messages: bool = True,
+        store_inputs: bool = True,
+        store_context_messages: bool = False,
+        store_context_from: set[str] | None = None,
+        store_outputs: bool = True,
+        skip_excluded: bool = False,
+        dumps: JsonDumps | None = None,
+        loads: JsonLoads | None = None,
+    ) -> None:
+        """Initialize the file history provider.
+
+        Args:
+            storage_path: Directory path where session history files will be stored.
+
+        Keyword Args:
+            source_id: Unique identifier for this provider instance.
+            load_messages: Whether to load messages before invocation.
+            store_inputs: Whether to store input messages.
+            store_context_messages: Whether to store context from other providers.
+            store_context_from: If set, only store context from these source_ids.
+            store_outputs: Whether to store response messages.
+            skip_excluded: When True, ``get_messages`` omits messages whose
+                ``additional_properties["_excluded"]`` is truthy.
+            dumps: Callable that serializes a message payload dict to JSON text
+                or UTF-8 bytes. The returned JSON must fit on a single line.
+            loads: Callable that deserializes JSON text or bytes back to a
+                message payload dict.
+        """
+        super().__init__(
+            source_id=source_id,
+            load_messages=load_messages,
+            store_inputs=store_inputs,
+            store_context_messages=store_context_messages,
+            store_context_from=store_context_from,
+            store_outputs=store_outputs,
+        )
+        self.storage_path = Path(storage_path)
+        self.storage_path.mkdir(parents=True, exist_ok=True)
+        self._storage_root = self.storage_path.resolve()
+        self.skip_excluded = skip_excluded
+        self.dumps = dumps or _default_json_dumps
+        self.loads = loads or _default_json_loads
+        self._async_write_locks_by_loop: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            tuple[asyncio.Lock, ...],
+        ] = weakref.WeakKeyDictionary()
+
+    async def get_messages(
+        self,
+        session_id: str | None,
+        *,
+        state: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Message]:
+        """Retrieve messages from the session's JSON Lines file."""
+        del state, kwargs
+        file_path = self._session_file_path(session_id)
+        async_lock = self._session_async_write_lock(file_path)
+        thread_lock = self._session_write_lock(file_path)
+
+        def _read_messages() -> list[Message]:
+            with thread_lock:
+                if not file_path.exists():
+                    return []
+
+                messages: list[Message] = []
+                with file_path.open(encoding="utf-8") as file_handle:
+                    for line_number, line in enumerate(file_handle, start=1):
+                        serialized = line.strip()
+                        if not serialized:
+                            continue
+                        try:
+                            payload = self.loads(serialized)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                f"Failed to deserialize history line {line_number} from '{file_path}'."
+                            ) from exc
+                        if not isinstance(payload, Mapping):
+                            raise ValueError(
+                                f"History line {line_number} in '{file_path}' did not deserialize to a mapping."
+                            )
+
+                        try:
+                            message = Message.from_dict(dict(cast(Mapping[str, Any], payload)))
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"History line {line_number} in '{file_path}' is not a valid Message payload."
+                            ) from exc
+                        messages.append(message)
+                return messages
+
+        async with async_lock:
+            messages = await asyncio.to_thread(_read_messages)
+        if self.skip_excluded:
+            messages = [m for m in messages if not m.additional_properties.get("_excluded", False)]
+        return messages
+
+    async def save_messages(
+        self,
+        session_id: str | None,
+        messages: Sequence[Message],
+        *,
+        state: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Append messages to the session's JSON Lines file."""
+        del state, kwargs
+        if not messages:
+            return
+
+        file_path = self._session_file_path(session_id)
+        async_lock = self._session_async_write_lock(file_path)
+        file_lock = self._session_write_lock(file_path)
+
+        def _append_messages() -> None:
+            with file_lock, file_path.open("a", encoding="utf-8") as file_handle:
+                for message in messages:
+                    file_handle.write(f"{self._serialize_message(message)}\n")
+
+        async with async_lock:
+            await asyncio.to_thread(_append_messages)
+
+    def _serialize_message(self, message: Message) -> str:
+        """Serialize a message payload to a single JSON Lines record."""
+        serialized = self.dumps(message.to_dict())
+        if isinstance(serialized, bytes):
+            serialized_text = serialized.decode("utf-8")
+        elif isinstance(serialized, str):
+            serialized_text = serialized
+        else:
+            raise TypeError("FileHistoryProvider.dumps must return str or bytes.")
+
+        if "\n" in serialized_text or "\r" in serialized_text:
+            raise ValueError("FileHistoryProvider.dumps must return single-line JSON for JSON Lines storage.")
+        return serialized_text
+
+    def _session_file_path(self, session_id: str | None) -> Path:
+        """Resolve the on-disk history file path for a session."""
+        file_path = (self._storage_root / f"{self._session_file_stem(session_id)}{self.FILE_EXTENSION}").resolve()
+        if not file_path.is_relative_to(self._storage_root):
+            raise ValueError(f"Session history path escaped storage directory: {session_id!r}")
+        return file_path
+
+    def _session_file_stem(self, session_id: str | None) -> str:
+        """Return the filename stem for a session."""
+        raw_session_id = session_id or self.DEFAULT_SESSION_FILE_STEM
+        if self._is_literal_session_file_stem_safe(raw_session_id):
+            return raw_session_id
+
+        encoded_session_id = urlsafe_b64encode(raw_session_id.encode("utf-8")).decode("ascii").rstrip("=")
+        return f"{self._ENCODED_SESSION_PREFIX}{encoded_session_id or self.DEFAULT_SESSION_FILE_STEM}"
+
+    def _session_async_write_lock(self, file_path: Path) -> asyncio.Lock:
+        """Return the event-loop-local async lock for a session history file."""
+        loop = asyncio.get_running_loop()
+        locks = self._async_write_locks_by_loop.get(loop)
+        if locks is None:
+            locks = tuple(asyncio.Lock() for _ in range(self._FILE_LOCK_STRIPE_COUNT))
+            self._async_write_locks_by_loop[loop] = locks
+        return locks[self._lock_index(file_path)]
+
+    @classmethod
+    def _session_write_lock(cls, file_path: Path) -> threading.Lock:
+        """Return the process-local thread lock for a session history file."""
+        return cls._FILE_WRITE_LOCKS[cls._lock_index(file_path)]
+
+    @classmethod
+    def _lock_index(cls, file_path: Path) -> int:
+        """Map a session history file to a bounded lock stripe."""
+        return hash(file_path) % cls._FILE_LOCK_STRIPE_COUNT
+
+    @classmethod
+    def _is_literal_session_file_stem_safe(cls, session_id: str) -> bool:
+        """Return whether the session ID can be used directly as a filename stem."""
+        if (
+            not session_id
+            or session_id.startswith(".")
+            or session_id.endswith((" ", "."))
+            or session_id.upper() in cls._WINDOWS_RESERVED_FILE_STEMS
+        ):
+            return False
+        if any(ord(character) < 32 for character in session_id):
+            return False
+        return all(character.isalnum() or character in "._-" for character in session_id)

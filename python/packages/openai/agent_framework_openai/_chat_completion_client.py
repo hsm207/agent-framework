@@ -59,23 +59,44 @@ from pydantic import BaseModel
 
 from ._exceptions import OpenAIContentFilterException
 from ._shared import (
+    PROMPT_CACHE_BREAKPOINT_KEY,
     AzureTokenProvider,
+    _attach_prompt_cache_breakpoint,  # pyright: ignore[reportPrivateUsage]
     load_openai_service_settings,
     maybe_append_azure_endpoint_guidance,
 )
 
 if sys.version_info >= (3, 13):
-    from typing import TypeVar  # type: ignore # pragma: no cover
+    from typing import TypeVar  # pragma: no cover
 else:
-    from typing_extensions import TypeVar  # type: ignore # pragma: no cover
+    from typing_extensions import TypeVar  # pragma: no cover
 if sys.version_info >= (3, 12):
-    from typing import override  # type: ignore # pragma: no cover
+    from typing import override  # pragma: no cover
 else:
-    from typing_extensions import override  # type: ignore # pragma: no cover
+    from typing_extensions import override  # pragma: no cover
 if sys.version_info >= (3, 11):
-    from typing import TypedDict  # type: ignore # pragma: no cover
+    from typing import TypedDict  # pragma: no cover
 else:
-    from typing_extensions import TypedDict  # type: ignore # pragma: no cover
+    from typing_extensions import TypedDict  # pragma: no cover
+
+try:
+    from openai.types.chat.completion_create_params import PromptCacheOptions
+
+    _prompt_cache_options_supported = True
+except ImportError:  # pragma: no cover
+    _prompt_cache_options_supported = False
+
+    class PromptCacheOptions(TypedDict, total=False):
+        """Fallback for openai versions that predate prompt cache options.
+
+        Mirrors the SDK's shape so ``prompt_cache_options`` type-checks the same on
+        every supported openai version; a runtime guard rejects the option when the
+        installed openai is too old to send it.
+        """
+
+        mode: Literal["implicit", "explicit"]
+        ttl: Literal["30m"]
+
 
 if TYPE_CHECKING:
     from azure.core.credentials import TokenCredential
@@ -84,6 +105,14 @@ if TYPE_CHECKING:
     AzureCredentialTypes = TokenCredential | AsyncTokenCredential
 
 logger = logging.getLogger("agent_framework.openai")
+
+# Error message shared with tests — extracted to a constant to keep the
+# implementation and its assertions in sync.
+_AZURE_WEB_SEARCH_UNSUPPORTED_MSG = (
+    "Web search is not supported by the Azure OpenAI Chat Completions API. "
+    "Use agent_framework.openai.OpenAIChatClient (Responses API) for "
+    "web search support on Azure."
+)
 
 DEFAULT_AZURE_OPENAI_CHAT_COMPLETION_API_VERSION = "2024-12-01-preview"
 
@@ -141,10 +170,20 @@ class OpenAIChatCompletionOptions(ChatOptions[ResponseModelT], Generic[ResponseM
     """
 
     # OpenAI-specific generation parameters (supported by all models)
-    logit_bias: dict[str | int, float]  # type: ignore[misc]
+    logit_bias: dict[str | int, float]
     logprobs: bool
     top_logprobs: int
     prediction: Prediction
+    verbosity: Literal["low", "medium", "high"]
+    """Output verbosity for GPT-5 family models. Lower values yield shorter responses.
+    See: https://developers.openai.com/cookbook/examples/gpt-5/gpt-5_new_params_and_tools#1-verbosity-parameter"""
+
+    prompt_cache_options: PromptCacheOptions
+    """Request-wide prompt cache policy for GPT-5.6 and later models.
+    Set mode to 'explicit' to use only the breakpoints set on content parts via
+    ``Content.additional_properties["prompt_cache_breakpoint"]``.
+    Sending this option requires openai 2.45.0 or later.
+    See: https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-breakpoints"""
 
 
 OpenAIChatCompletionOptionsT = TypeVar(
@@ -161,7 +200,7 @@ OPTION_TRANSLATIONS: dict[str, str] = {
 
 
 # region Base Client
-class RawOpenAIChatCompletionClient(  # type: ignore[misc]
+class RawOpenAIChatCompletionClient(
     BaseChatClient[OpenAIChatCompletionOptionsT],
     Generic[OpenAIChatCompletionOptionsT],
 ):
@@ -370,6 +409,7 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
         else:
             self.default_headers = None
         self.instruction_role = instruction_role
+        self._use_azure_client = use_azure_client
         if use_azure_client:
             self.OTEL_PROVIDER_NAME = "azure.ai.openai"  # type: ignore[misc]
 
@@ -485,9 +525,9 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
         """Get a response from the raw OpenAI chat client."""
         super_get_response = cast(
             "Callable[..., Awaitable[ChatResponse[Any]] | ResponseStream[ChatResponseUpdate, ChatResponse[Any]]]",
-            super().get_response,  # type: ignore[misc]
+            super().get_response,
         )
-        return super_get_response(  # type: ignore[no-any-return]
+        return super_get_response(
             messages=messages,
             stream=stream,
             options=options,
@@ -586,6 +626,12 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
         Converts FunctionTool to JSON schema format. Web search tools are routed
         to web_search_options parameter. All other tools pass through unchanged.
 
+        Note:
+            Azure OpenAI Chat Completions API does not support ``web_search_options``.
+            When configured with an Azure endpoint, passing web search tools raises
+            :class:`ValueError`. Use :class:`~agent_framework.openai.OpenAIChatClient`
+            (Responses API) for web search support on Azure.
+
         Args:
             tools: Tool(s) to prepare.
 
@@ -600,6 +646,8 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
             elif isinstance(tool, MutableMapping):
                 typed_tool = cast(MutableMapping[str, Any], tool)
                 if typed_tool.get("type") == "web_search":
+                    if self._use_azure_client:
+                        raise ValueError(_AZURE_WEB_SEARCH_UNSUPPORTED_MSG)
                     # Web search is handled via web_search_options, not tools array
                     web_search_options = {k: v for k, v in typed_tool.items() if k != "type"}
                 else:
@@ -626,6 +674,11 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
         run_options = {
             k: v for k, v in options.items() if v is not None and k not in {"instructions", "tools", "conversation_id"}
         }
+
+        if run_options.get("prompt_cache_options") is not None and not _prompt_cache_options_supported:
+            raise ChatClientInvalidRequestException(
+                "prompt_cache_options requires openai>=2.45.0; upgrade the openai package to use it."
+            )
 
         # messages
         if messages and "messages" not in run_options:
@@ -662,6 +715,12 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
                         "type": "function",
                         "function": {"name": func_name},
                     }
+                elif mode in ("auto", "required") and tool_mode.get("allowed_tools") is not None:
+                    logger.warning(
+                        "allowed_tools is not supported by the Chat Completions API; "
+                        "the setting will be ignored. Use OpenAIChatClient (Responses API) instead."
+                    )
+                    run_options["tool_choice"] = mode
                 else:
                     run_options["tool_choice"] = mode
 
@@ -681,7 +740,7 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
         for choice in response.choices:
             response_metadata.update(self._get_metadata_from_chat_choice(choice))
             if choice.finish_reason:
-                finish_reason = choice.finish_reason  # type: ignore[assignment]
+                finish_reason = "tool_calls" if choice.finish_reason == "function_call" else choice.finish_reason  # type: ignore[assignment]
             contents: list[Content] = []
             if text_content := self._parse_text_from_openai(choice):
                 contents.append(text_content)
@@ -719,10 +778,16 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
 
         for choice in chunk.choices:
             chunk_metadata.update(self._get_metadata_from_chat_choice(choice))
-            contents.extend(self._parse_tool_calls_from_openai(choice))
             if choice.finish_reason:
-                finish_reason = choice.finish_reason  # type: ignore[assignment]
+                finish_reason = "tool_calls" if choice.finish_reason == "function_call" else choice.finish_reason  # type: ignore[assignment]
 
+            # Some OpenAI-compatible providers (e.g. Azure) send `"delta": null`
+            # on finish chunks instead of the spec-compliant `"delta": {}`.
+            # Guard here so all content-parsing below can assume delta is present.
+            if choice.delta is None:  # pyright: ignore[reportUnnecessaryComparison]
+                continue
+
+            contents.extend(self._parse_tool_calls_from_openai(choice))
             if text_content := self._parse_text_from_openai(choice):
                 contents.append(text_content)
             if reasoning_details := getattr(choice.delta, "reasoning_details", None):
@@ -747,18 +812,20 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
         )
         if usage.completion_tokens_details:
             if tokens := usage.completion_tokens_details.accepted_prediction_tokens:
-                details["completion/accepted_prediction_tokens"] = tokens  # type: ignore[typeddict-unknown-key]
+                details["completion/accepted_prediction_tokens"] = tokens
             if tokens := usage.completion_tokens_details.audio_tokens:
-                details["completion/audio_tokens"] = tokens  # type: ignore[typeddict-unknown-key]
-            if tokens := usage.completion_tokens_details.reasoning_tokens:
-                details["completion/reasoning_tokens"] = tokens  # type: ignore[typeddict-unknown-key]
+                details["completion/audio_tokens"] = tokens
+            if (tokens := usage.completion_tokens_details.reasoning_tokens) is not None:
+                details["completion/reasoning_tokens"] = tokens
+                details["reasoning_output_token_count"] = tokens
             if tokens := usage.completion_tokens_details.rejected_prediction_tokens:
-                details["completion/rejected_prediction_tokens"] = tokens  # type: ignore[typeddict-unknown-key]
+                details["completion/rejected_prediction_tokens"] = tokens
         if usage.prompt_tokens_details:
             if tokens := usage.prompt_tokens_details.audio_tokens:
-                details["prompt/audio_tokens"] = tokens  # type: ignore[typeddict-unknown-key]
-            if tokens := usage.prompt_tokens_details.cached_tokens:
-                details["prompt/cached_tokens"] = tokens  # type: ignore[typeddict-unknown-key]
+                details["prompt/audio_tokens"] = tokens
+            if (tokens := usage.prompt_tokens_details.cached_tokens) is not None:
+                details["prompt/cached_tokens"] = tokens
+                details["cache_read_input_token_count"] = tokens
         return details
 
     def _parse_text_from_openai(self, choice: Choice | ChunkChoice) -> Content | None:
@@ -773,13 +840,13 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
     def _get_metadata_from_chat_response(self, response: ChatCompletion) -> dict[str, Any]:
         """Get metadata from a chat response."""
         return {
-            "system_fingerprint": response.system_fingerprint,
+            "system_fingerprint": getattr(response, "system_fingerprint", None),
         }
 
     def _get_metadata_from_streaming_chat_response(self, response: ChatCompletionChunk) -> dict[str, Any]:
         """Get metadata from a streaming chat response."""
         return {
-            "system_fingerprint": response.system_fingerprint,
+            "system_fingerprint": getattr(response, "system_fingerprint", None),
         }
 
     def _get_metadata_from_chat_choice(self, choice: Choice | ChunkChoice) -> dict[str, Any]:
@@ -839,12 +906,22 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
 
     def _prepare_message_for_openai(self, message: Message) -> list[dict[str, Any]]:
         """Prepare a chat message for OpenAI."""
-        # System/developer messages must use plain string content because some
-        # OpenAI-compatible endpoints reject list content for non-user roles.
+        # System/developer messages default to plain string content because some
+        # OpenAI-compatible endpoints reject list content for non-user roles. The
+        # exception is a prompt cache breakpoint on a text part: it can only live on
+        # a typed part, so opting in switches that message to list content.
         if message.role in ("system", "developer"):
-            texts = [content.text for content in message.contents if content.type == "text" and content.text]
-            if texts:
-                sys_args: dict[str, Any] = {"role": message.role, "content": "\n".join(texts)}
+            text_contents = [content for content in message.contents if content.type == "text" and content.text]
+            if text_contents:
+                # Keep list form only if a breakpoint actually landed on a built part
+                # (mirrors the flatten logic below); a non-mapping value stays a string.
+                parts = [self._prepare_content_for_openai(content) for content in text_contents]
+                content_value: str | list[dict[str, Any]]
+                if any(PROMPT_CACHE_BREAKPOINT_KEY in part for part in parts):
+                    content_value = parts
+                else:
+                    content_value = "\n".join(content.text for content in text_contents if content.text)
+                sys_args: dict[str, Any] = {"role": message.role, "content": content_value}
                 if message.author_name:
                     sys_args["name"] = message.author_name
                 return [sys_args]
@@ -872,7 +949,7 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
                         # If the last message already has tool calls, append to it
                         all_messages[-1]["tool_calls"].append(self._prepare_content_for_openai(content))
                     else:
-                        args["tool_calls"] = [self._prepare_content_for_openai(content)]  # type: ignore
+                        args["tool_calls"] = [self._prepare_content_for_openai(content)]
                 case "function_result":
                     args["tool_call_id"] = content.call_id
                     if content.items:
@@ -892,6 +969,10 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
                 case "text_reasoning" if (protected_data := content.protected_data) is not None:
                     # Buffer reasoning to attach to the next message with content/tool_calls
                     pending_reasoning = json.loads(protected_data)
+                case "text_reasoning":
+                    if content.text is None:
+                        continue
+                    args["content"] = [{"type": "text", "text": content.text}]
                 case _:
                     if "content" not in args:
                         args["content"] = []
@@ -931,6 +1012,10 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
                     text_item = cast(Mapping[str, Any], item)
                     if text_item.get("type") != "text":
                         break
+                    if PROMPT_CACHE_BREAKPOINT_KEY in text_item:
+                        # A plain string cannot carry a prompt cache breakpoint;
+                        # keep the typed part form for this message.
+                        break
                     text_items.append(text_item)
                 else:
                     msg["content"] = "\n".join(
@@ -943,6 +1028,11 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
     def _prepare_content_for_openai(self, content: Content) -> dict[str, Any]:
         """Prepare content for OpenAI."""
         match content.type:
+            case "text":
+                return _attach_prompt_cache_breakpoint(
+                    {"type": "text", "text": content.text},
+                    content,
+                )
             case "function_call":
                 args = json.dumps(content.arguments) if isinstance(content.arguments, Mapping) else content.arguments
                 return {
@@ -960,10 +1050,13 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
                 detail = content.additional_properties.get("detail")
                 if isinstance(detail, str):
                     image_url_obj["detail"] = detail
-                return {
-                    "type": "image_url",
-                    "image_url": image_url_obj,
-                }
+                return _attach_prompt_cache_breakpoint(
+                    {
+                        "type": "image_url",
+                        "image_url": image_url_obj,
+                    },
+                    content,
+                )
             case "data" | "uri" if content.has_top_level_media_type("audio"):
                 if content.media_type and "wav" in content.media_type:
                     audio_format = "wav"
@@ -979,13 +1072,16 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
                     # Extract just the base64 part after "data:audio/format;base64,"
                     audio_data = audio_data.split(",", 1)[-1]  # type: ignore[union-attr]
 
-                return {
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": audio_data,
-                        "format": audio_format,
+                return _attach_prompt_cache_breakpoint(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio_data,
+                            "format": audio_format,
+                        },
                     },
-                }
+                    content,
+                )
             case "data" | "uri" if content.has_top_level_media_type("application") and content.uri.startswith("data:"):  # type: ignore[union-attr]
                 # All application/* media types should be treated as files for OpenAI
                 filename = getattr(content, "filename", None) or (
@@ -996,10 +1092,13 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
                 file_obj = {"file_data": content.uri}
                 if filename:
                     file_obj["filename"] = filename
-                return {
-                    "type": "file",
-                    "file": file_obj,
-                }
+                return _attach_prompt_cache_breakpoint(
+                    {
+                        "type": "file",
+                        "file": file_obj,
+                    },
+                    content,
+                )
             case _:
                 # Default fallback for all other content types
                 return content.to_dict(exclude_none=True)
@@ -1017,7 +1116,7 @@ class RawOpenAIChatCompletionClient(  # type: ignore[misc]
 # region Public client
 
 
-class OpenAIChatCompletionClient(  # type: ignore[misc]
+class OpenAIChatCompletionClient(
     FunctionInvocationLayer[OpenAIChatCompletionOptionsT],
     ChatMiddlewareLayer[OpenAIChatCompletionOptionsT],
     ChatTelemetryLayer[OpenAIChatCompletionOptionsT],
@@ -1026,7 +1125,7 @@ class OpenAIChatCompletionClient(  # type: ignore[misc]
 ):
     """OpenAI Chat completion class with middleware, telemetry, and function invocation support."""
 
-    OTEL_PROVIDER_NAME: ClassVar[str] = "openai"  # type: ignore[reportIncompatibleVariableOverride, misc]
+    OTEL_PROVIDER_NAME: ClassVar[str] = "openai"
 
     @overload
     def __init__(
@@ -1282,12 +1381,12 @@ class OpenAIChatCompletionClient(  # type: ignore[misc]
         """Get a response from the OpenAI chat client with all standard layers enabled."""
         super_get_response = cast(
             "Callable[..., Awaitable[ChatResponse[Any]] | ResponseStream[ChatResponseUpdate, ChatResponse[Any]]]",
-            super().get_response,  # type: ignore[misc]
+            super().get_response,
         )
         effective_client_kwargs = dict(client_kwargs) if client_kwargs is not None else {}
         if middleware is not None:
             effective_client_kwargs["middleware"] = middleware
-        return super_get_response(  # type: ignore[no-any-return]
+        return super_get_response(
             messages=messages,
             stream=stream,
             options=options,

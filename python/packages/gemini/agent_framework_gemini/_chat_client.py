@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import sys
-from collections.abc import AsyncIterable, Awaitable, Mapping, Sequence
+from collections.abc import AsyncIterable, Awaitable, Callable, Mapping, Sequence
 from typing import Any, ClassVar, Generic, cast
 from uuid import uuid4
 
 from agent_framework import (
-    AGENT_FRAMEWORK_USER_AGENT,
     BaseChatClient,
     ChatAndFunctionMiddlewareTypes,
     ChatMiddlewareLayer,
@@ -25,28 +25,33 @@ from agent_framework import (
     Message,
     ResponseStream,
     UsageDetails,
+    detect_media_type_from_base64,
     validate_tool_mode,
 )
 from agent_framework._settings import SecretString, load_settings
+from agent_framework._telemetry import get_user_agent
+from agent_framework._types import _get_data_bytes  # type: ignore[reportPrivateUsage]
+from agent_framework.exceptions import ContentError
 from agent_framework.observability import ChatTelemetryLayer
 from google import genai
+from google.auth.credentials import Credentials
 from google.genai import types
 from pydantic import BaseModel
 
 if sys.version_info >= (3, 13):
-    from typing import TypeVar  # type: ignore # pragma: no cover
+    from typing import TypeVar  # pragma: no cover
 else:
-    from typing_extensions import TypeVar  # type: ignore # pragma: no cover
+    from typing_extensions import TypeVar  # pragma: no cover
 
 if sys.version_info >= (3, 12):
-    from typing import override  # type: ignore # pragma: no cover
+    from typing import override  # pragma: no cover
 else:
-    from typing_extensions import override  # type: ignore # pragma: no cover
+    from typing_extensions import override  # pragma: no cover
 
 if sys.version_info >= (3, 11):
-    from typing import TypedDict  # type: ignore # pragma: no cover
+    from typing import TypedDict  # pragma: no cover
 else:
-    from typing_extensions import TypedDict  # type: ignore # pragma: no cover
+    from typing_extensions import TypedDict  # pragma: no cover
 
 logger = logging.getLogger("agent_framework.gemini")
 
@@ -54,6 +59,7 @@ __all__ = [
     "GeminiChatClient",
     "GeminiChatOptions",
     "GeminiSettings",
+    "GoogleGeminiSettings",
     "RawGeminiChatClient",
     "ThinkingConfig",
 ]
@@ -107,8 +113,8 @@ class GeminiChatOptions(ChatOptions[ResponseModelT], Generic[ResponseModelT], to
             or ``types.Tool`` objects returned by ``get_code_interpreter_tool``, ``get_web_search_tool``,
             ``get_mcp_tool``, ``get_file_search_tool``, or ``get_maps_grounding_tool``.
         tool_choice: How the model picks a tool. One of ``'auto'``, ``'none'``, or ``'required'``.
-        response_format: Pydantic model type for structured JSON output. The response text is
-            parsed into the model and exposed via ``ChatResponse.value``.
+        response_format: Pydantic model type or JSON schema mapping for structured JSON output.
+            The response text is parsed and exposed via ``ChatResponse.value``.
         instructions: Extra system-level instructions prepended to the system message.
 
     Not supported, and passing these raises a type error:
@@ -161,10 +167,74 @@ class GeminiSettings(TypedDict, total=False):
     model: str | None
 
 
+class GoogleGeminiSettings(TypedDict, total=False):
+    """Google SDK configuration settings loaded from ``GOOGLE_*`` environment variables."""
+
+    api_key: SecretString | None
+    model: str | None
+    genai_use_vertexai: bool | None
+    cloud_project: str | None
+    cloud_location: str | None
+
+
 # endregion
 
 
-_GEMINI_SERVICE_URL = "https://generativelanguage.googleapis.com"
+_GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
+_VERTEX_AI_BASE_URL = "https://aiplatform.googleapis.com"
+
+
+def _resolve_vertexai_mode(client: genai.Client, *, fallback: bool | None = None) -> bool:
+    """Resolve whether a client targets Vertex AI, preferring the instantiated SDK client state."""
+    api_client = getattr(client, "_api_client", None)
+    vertexai = getattr(api_client, "vertexai", None)
+    if isinstance(vertexai, bool):
+        return vertexai
+    return bool(fallback)
+
+
+def _resolve_service_url(client: genai.Client, *, vertexai: bool) -> str:
+    """Resolve the base service URL from the instantiated SDK client, with a stable fallback."""
+    api_client = getattr(client, "_api_client", None)
+    http_options = getattr(api_client, "_http_options", None)
+    base_url = getattr(http_options, "base_url", None)
+    if isinstance(base_url, str) and base_url:
+        return base_url.rstrip("/")
+    return _VERTEX_AI_BASE_URL if vertexai else _GEMINI_API_BASE_URL
+
+
+def _validate_client_auth_configuration(
+    *,
+    vertexai: bool | None,
+    api_key: SecretString | None,
+    project: str | None,
+    location: str | None,
+    credentials: Credentials | None,
+) -> None:
+    """Validate supported auth combinations before instantiating the SDK client."""
+    if vertexai is not True:
+        if api_key is None:
+            raise ValueError(
+                "Gemini client requires an API key when Vertex AI is not enabled. "
+                "Set GOOGLE_API_KEY or GEMINI_API_KEY, or pass api_key explicitly."
+            )
+        return
+
+    if api_key is not None or credentials is not None or (project and location):
+        return
+
+    if project or location:
+        raise ValueError(
+            "Gemini client requires both GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION "
+            "when Vertex AI is enabled without an API key."
+        )
+
+    raise ValueError(
+        "Gemini client requires Vertex AI credentials or configuration when Vertex AI is enabled. "
+        "Provide GOOGLE_API_KEY for Vertex AI express mode, pass credentials, or set "
+        "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION."
+    )
+
 
 # Keys mapping to a different GenerateContentConfig field name
 _OPTION_TRANSLATIONS: dict[str, str] = {
@@ -189,6 +259,29 @@ _OPTION_CONSUMED_KEYS: frozenset[str] = frozenset({
 
 _OPTION_EXCLUDE_KEYS: frozenset[str] = _OPTION_EXPLICIT_KEYS | _OPTION_CONSUMED_KEYS
 
+_JSON_SCHEMA_TYPES: frozenset[str] = frozenset({
+    "array",
+    "boolean",
+    "integer",
+    "null",
+    "number",
+    "object",
+    "string",
+})
+
+_JSON_SCHEMA_KEYWORDS: frozenset[str] = frozenset({
+    "$defs",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "enum",
+    "items",
+    "oneOf",
+    "properties",
+    "required",
+    "type",
+})
+
 _FINISH_REASON_MAP: dict[str, FinishReasonLiteral] = {
     "STOP": "stop",
     "MAX_TOKENS": "length",
@@ -210,20 +303,24 @@ class RawGeminiChatClient(
     BaseChatClient[GeminiChatOptionsT],
     Generic[GeminiChatOptionsT],
 ):
-    """A raw Gemini chat client for the Google Gemini API without function invocation, middleware or telemetry.
+    """A raw Gemini chat client for Gemini Developer API or Vertex AI.
 
     Use this when you want full control over the request pipeline. For instance, to opt out of
     telemetry, use custom middleware, or compose your own layers. If you want the full-featured
     client with batteries included, use `GeminiChatClient` instead.
     """
 
-    OTEL_PROVIDER_NAME: ClassVar[str] = "gcp.gemini"  # type: ignore[reportIncompatibleVariableOverride, misc]
+    OTEL_PROVIDER_NAME: ClassVar[str] = "gcp.gemini"
 
     def __init__(
         self,
         *,
         api_key: str | None = None,
         model: str | None = None,
+        vertexai: bool | None = None,
+        project: str | None = None,
+        location: str | None = None,
+        credentials: Credentials | None = None,
         env_file_path: str | None = None,
         env_file_encoding: str | None = None,
         client: genai.Client | None = None,
@@ -232,11 +329,21 @@ class RawGeminiChatClient(
         """Create a raw Gemini chat client.
 
         Args:
-            api_key: Google AI Studio API key. Falls back to ``GEMINI_API_KEY`` environment variable.
-            model: Default model identifier. Falls back to ``GEMINI_MODEL`` environment variable.
+            api_key: Gemini Developer API key. Falls back to environment settings, preferring
+                ``GOOGLE_API_KEY`` over ``GEMINI_API_KEY``.
+            model: Default model identifier. Falls back to environment settings, preferring
+                ``GOOGLE_MODEL`` over ``GEMINI_MODEL``.
+            vertexai: Whether to use Vertex AI endpoints. Falls back to environment settings,
+                using ``GOOGLE_GENAI_USE_VERTEXAI`` when not passed explicitly.
+            project: Google Cloud project ID for Vertex AI. Falls back to environment settings,
+                using ``GOOGLE_CLOUD_PROJECT`` when not passed explicitly.
+            location: Vertex AI location. Falls back to environment settings, preferring
+                using ``GOOGLE_CLOUD_LOCATION`` when not passed explicitly.
+            credentials: Google Cloud credentials for Vertex AI. When omitted, the SDK can use
+                Application Default Credentials.
             env_file_path: Path to a ``.env`` file for credential loading.
             env_file_encoding: Encoding for the ``.env`` file.
-            client: Pre-built ``genai.Client`` instance. When provided, ``api_key`` is not required.
+            client: Pre-built ``genai.Client`` instance. When provided, connector auth settings are not required.
             additional_properties: Extra properties stored on the client instance.
         """
         settings = load_settings(
@@ -247,21 +354,58 @@ class RawGeminiChatClient(
             env_file_path=env_file_path,
             env_file_encoding=env_file_encoding,
         )
+        google_settings = load_settings(
+            GoogleGeminiSettings,
+            env_prefix="GOOGLE_",
+            api_key=api_key,
+            model=model,
+            genai_use_vertexai=vertexai,
+            cloud_project=project,
+            cloud_location=location,
+            env_file_path=env_file_path,
+            env_file_encoding=env_file_encoding,
+        )
 
+        configured_vertexai = google_settings.get("genai_use_vertexai")
         if client:
             self._genai_client = client
         else:
-            resolved_key = settings.get("api_key")
-            if not resolved_key:
-                raise ValueError(
-                    "Gemini API key is required. Set via api_key parameter or GEMINI_API_KEY environment variable."
-                )
-            self._genai_client = genai.Client(
-                api_key=resolved_key.get_secret_value(),
-                http_options={"headers": {"x-goog-api-client": AGENT_FRAMEWORK_USER_AGENT}},
+            resolved_key = google_settings.get("api_key") or settings.get("api_key")
+            resolved_project = google_settings.get("cloud_project")
+            resolved_location = google_settings.get("cloud_location")
+            _validate_client_auth_configuration(
+                vertexai=configured_vertexai,
+                api_key=resolved_key,
+                project=resolved_project,
+                location=resolved_location,
+                credentials=credentials,
             )
 
-        self.model = settings.get("model")
+            client_kwargs: dict[str, Any] = {
+                "http_options": {"headers": {"x-goog-api-client": get_user_agent()}},
+            }
+            if configured_vertexai is not None:
+                client_kwargs["vertexai"] = configured_vertexai
+
+            if resolved_key is not None and (
+                configured_vertexai is not True
+                or (credentials is None and not (resolved_project and resolved_location))
+            ):
+                client_kwargs["api_key"] = resolved_key.get_secret_value()
+
+            if configured_vertexai is True and resolved_project:
+                client_kwargs["project"] = resolved_project
+
+            if configured_vertexai is True and resolved_location:
+                client_kwargs["location"] = resolved_location
+            if configured_vertexai is True and credentials is not None:
+                client_kwargs["credentials"] = credentials
+
+            self._genai_client = genai.Client(**client_kwargs)
+
+        self._vertexai = _resolve_vertexai_mode(self._genai_client, fallback=configured_vertexai)
+        self._service_url = _resolve_service_url(self._genai_client, vertexai=self._vertexai)
+        self.model = google_settings.get("model") or settings.get("model")
 
         super().__init__(additional_properties=additional_properties)
 
@@ -395,9 +539,13 @@ class RawGeminiChatClient(
             async def _stream() -> AsyncIterable[ChatResponseUpdate]:
                 validated = await self._validate_options(options)
                 model, contents, config = self._prepare_request(messages, validated)
-                async for chunk in await self._genai_client.aio.models.generate_content_stream(  # pyright: ignore[reportUnknownMemberType]
+                generate_content_stream = cast(
+                    Callable[..., Awaitable[AsyncIterable[types.GenerateContentResponse]]],
+                    cast(Any, self._genai_client.aio.models).generate_content_stream,
+                )
+                async for chunk in await generate_content_stream(
                     model=model,
-                    contents=contents,  # type: ignore[arg-type]
+                    contents=contents,
                     config=config,
                 ):
                     yield self._process_chunk(chunk)
@@ -414,12 +562,12 @@ class RawGeminiChatClient(
 
     @override
     def service_url(self) -> str:
-        """Return the base URL of the Gemini API service.
+        """Return the base URL of the configured Gemini or Vertex AI service.
 
         Returns:
-            The Gemini API base URL.
+            The resolved service base URL.
         """
-        return _GEMINI_SERVICE_URL
+        return self._service_url
 
     # region Request preparation
 
@@ -520,26 +668,120 @@ class RawGeminiChatClient(
             A list of Gemini Part objects representing the message contents.
         """
         parts: list[types.Part] = []
+        pending_signature: bytes | None = None
         for content in message_contents:
+            if content.type == "text_reasoning":
+                # Gemini 3's thought_signature travels as base64 protected_data on reasoning content;
+                # hold it for the function call it precedes (reasoning is not sent back as a Part).
+                pending_signature = None
+                encoded_signature = content.protected_data
+                if isinstance(encoded_signature, str) and encoded_signature:
+                    try:
+                        pending_signature = base64.b64decode(encoded_signature, validate=True)
+                    except ValueError:
+                        logger.warning("Ignoring malformed thought_signature on reasoning content")
+                continue
+            # A signature applies only to a function call immediately following its reasoning content.
+            thought_signature = pending_signature
+            pending_signature = None
             match content.type:
                 case "text":
                     parts.append(types.Part(text=content.text or ""))
                 case "function_call":
                     call_id = content.call_id or self._generate_tool_call_id()
+                    raw_part = content.raw_representation
+                    if (
+                        content.informational_only
+                        and isinstance(raw_part, types.Part)
+                        and raw_part.tool_call is not None
+                    ):
+                        tool_call = raw_part.tool_call.model_copy(
+                            update={
+                                "id": call_id,
+                                "args": content.parse_arguments() or {},
+                            },
+                            deep=True,
+                        )
+                        parts.append(raw_part.model_copy(update={"tool_call": tool_call}, deep=True))
+                        continue
                     if content.name:
                         call_id_to_name[call_id] = content.name
-                    parts.append(
-                        types.Part(
-                            function_call=types.FunctionCall(
-                                id=call_id,
-                                name=content.name or "",
-                                args=content.parse_arguments() or {},
-                            )
-                        )
+                    function_call = types.FunctionCall(
+                        id=call_id,
+                        name=content.name or "",
+                        args=content.parse_arguments() or {},
                     )
+                    # Echo the signature from the preceding reasoning content, backfilling only when
+                    # the raw Part lacks one.
+                    if isinstance(raw_part, types.Part) and raw_part.function_call is not None:
+                        replayed_part = raw_part.model_copy(update={"function_call": function_call}, deep=True)
+                        if replayed_part.thought_signature is None and thought_signature is not None:
+                            replayed_part.thought_signature = thought_signature
+                        parts.append(replayed_part)
+                    else:
+                        parts.append(types.Part(function_call=function_call, thought_signature=thought_signature))
+                case "function_result":
+                    raw_part = content.raw_representation
+                    if isinstance(raw_part, types.Part) and raw_part.tool_response is not None:
+                        tool_response = raw_part.tool_response.model_copy(
+                            update={
+                                "id": content.call_id or self._generate_tool_call_id(),
+                                "response": content.result,
+                            },
+                            deep=True,
+                        )
+                        parts.append(raw_part.model_copy(update={"tool_response": tool_response}, deep=True))
+                    else:
+                        logger.debug("Skipping unsupported content type for Gemini: %s", content.type)
+                case "data" | "uri":
+                    part = self._convert_data_or_uri_content(content)
+                    if part is not None:
+                        parts.append(part)
                 case _:
                     logger.debug("Skipping unsupported content type for Gemini: %s", content.type)
         return parts
+
+    def _convert_data_or_uri_content(self, content: Content) -> types.Part | None:
+        """Convert a ``data`` or ``uri`` Content to a Gemini Part.
+
+        Data URIs (``type="data"``) become ``inline_data`` Parts with the decoded bytes.
+        External URIs (``type="uri"``) become ``file_data`` Parts referencing the resource.
+
+        Args:
+            content: The framework Content object, expected to be of type ``data`` or ``uri``.
+
+        Returns:
+            A Gemini Part carrying the multimodal content, or None if the content cannot be
+            converted (e.g. missing URI, non-base64 data URI, or undecodable data).
+        """
+        uri = content.uri
+        if not uri:
+            logger.warning("Skipping %s content for Gemini: missing uri", content.type)
+            return None
+
+        if uri.startswith("data:"):
+            try:
+                raw_bytes = _get_data_bytes(content)
+            except ContentError:
+                logger.warning("Skipping data content for Gemini: data URI is not valid base64")
+                return None
+            if not raw_bytes:
+                logger.warning("Skipping data content for Gemini: no data found in URI")
+                return None
+            mime_type = content.media_type or detect_media_type_from_base64(data_bytes=raw_bytes)
+            if not mime_type:
+                logger.warning("Skipping data content for Gemini: missing media_type")
+                return None
+            return types.Part.from_bytes(data=raw_bytes, mime_type=mime_type)
+
+        try:
+            return types.Part.from_uri(file_uri=uri, mime_type=content.media_type)
+        except ValueError:
+            # from_uri raises when no media_type is given and one cannot be inferred from the URI
+            # (e.g. presigned URLs or API endpoints without an extension). Pass the URI through
+            # without a mime type rather than dropping the content or raising.
+            logger.warning("Could not determine media_type for URI content; sending to Gemini without one: %s", uri)
+            return types.Part(file_data=types.FileData(file_uri=uri, mime_type=None))
 
     def _convert_function_result(
         self,
@@ -558,6 +800,17 @@ class RawGeminiChatClient(
         """
         if content.type != "function_result":
             return None
+
+        raw_part = content.raw_representation
+        if isinstance(raw_part, types.Part) and raw_part.tool_response is not None:
+            tool_response = raw_part.tool_response.model_copy(
+                update={
+                    "id": content.call_id or self._generate_tool_call_id(),
+                    "response": content.result,
+                },
+                deep=True,
+            )
+            return raw_part.model_copy(update={"tool_response": tool_response}, deep=True)
 
         name = call_id_to_name.get(content.call_id or "")
         if not name:
@@ -629,9 +882,13 @@ class RawGeminiChatClient(
                 continue
             kwargs[_OPTION_TRANSLATIONS.get(key, key)] = value
 
-        if options.get("response_format") or options.get("response_schema"):
+        response_format = options.get("response_format")
+        response_schema = options.get("response_schema")
+        if response_format is not None or response_schema is not None:
             kwargs["response_mime_type"] = "application/json"
-        if schema := options.get("response_schema"):
+        if response_schema is not None:
+            kwargs["response_schema"] = response_schema
+        elif (schema := self._extract_response_schema(response_format)) is not None:
             kwargs["response_schema"] = schema
         if tools := self._prepare_tools(options):
             kwargs["tools"] = tools
@@ -643,6 +900,48 @@ class RawGeminiChatClient(
                 kwargs["thinking_config"] = types.ThinkingConfig(**thinking_config_kwargs)
 
         return types.GenerateContentConfig(**kwargs)
+
+    @staticmethod
+    def _extract_response_schema(response_format: Any) -> dict[str, Any] | None:
+        """Extract a Gemini response schema from supported mapping response_format shapes."""
+        if not isinstance(response_format, Mapping):
+            return None
+        mapping = cast("Mapping[str, Any]", response_format)
+
+        if (nested := RawGeminiChatClient._extract_response_schema(mapping.get("format"))) is not None:
+            return nested
+
+        json_schema = mapping.get("json_schema")
+        if isinstance(json_schema, Mapping):
+            schema = cast("Mapping[str, Any]", json_schema).get("schema")
+            if isinstance(schema, Mapping):
+                return dict(cast("Mapping[str, Any]", schema))
+
+        schema = mapping.get("schema")
+        if isinstance(schema, Mapping):
+            return dict(cast("Mapping[str, Any]", schema))
+
+        if RawGeminiChatClient._is_json_schema_mapping(mapping):
+            return dict(mapping)
+
+        return None
+
+    @staticmethod
+    def _is_json_schema_mapping(value: Mapping[str, Any]) -> bool:
+        """Return True when a mapping appears to be a JSON Schema rather than a response-format envelope."""
+        if not any(keyword in value for keyword in _JSON_SCHEMA_KEYWORDS):
+            return False
+
+        schema_type = value.get("type")
+        if schema_type is None:
+            return True
+        if isinstance(schema_type, str):
+            return schema_type in _JSON_SCHEMA_TYPES
+        if isinstance(schema_type, Sequence) and not isinstance(schema_type, (str, bytes)):
+            entries = cast("Sequence[object]", schema_type)
+            return all(isinstance(item, str) and item in _JSON_SCHEMA_TYPES for item in entries)
+
+        return False
 
     def _prepare_tools(self, options: Mapping[str, Any]) -> list[types.Tool] | None:
         """Translate the framework tool list into Gemini API tool objects.
@@ -705,19 +1004,28 @@ class RawGeminiChatClient(
 
         match tool_mode.get("mode"):
             case "auto":
-                function_calling_mode, allowed_names = types.FunctionCallingConfigMode.AUTO, None
+                if "allowed_tools" in tool_mode:
+                    function_calling_mode = types.FunctionCallingConfigMode.VALIDATED
+                    allowed_names = list(tool_mode["allowed_tools"])
+                else:
+                    function_calling_mode, allowed_names = types.FunctionCallingConfigMode.AUTO, None
             case "none":
                 function_calling_mode, allowed_names = types.FunctionCallingConfigMode.NONE, None
             case "required":
                 function_calling_mode = types.FunctionCallingConfigMode.ANY
                 name = tool_mode.get("required_function_name")
-                allowed_names = [name] if name else None
+                if name:
+                    allowed_names = [name]
+                elif "allowed_tools" in tool_mode:
+                    allowed_names = list(tool_mode["allowed_tools"])
+                else:
+                    allowed_names = None
             case unknown_mode:
                 logger.warning("Unsupported tool_choice mode for Gemini: %s", unknown_mode)
                 return None
 
         function_calling_kwargs: dict[str, Any] = {"mode": function_calling_mode}
-        if allowed_names:
+        if allowed_names is not None:
             function_calling_kwargs["allowed_function_names"] = allowed_names
 
         return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(**function_calling_kwargs))
@@ -803,6 +1111,35 @@ class RawGeminiChatClient(
                 continue
             if part.text is not None:
                 contents.append(Content.from_text(text=part.text, raw_representation=part))
+            elif part.tool_call is not None:
+                tool_call = part.tool_call
+                if tool_call.id:
+                    call_id = tool_call.id
+                else:
+                    call_id = self._generate_tool_call_id()
+                    logger.debug("tool_call missing id; generated fallback call_id=%r", call_id)
+                if isinstance(tool_call.tool_type, types.ToolType):
+                    tool_name = tool_call.tool_type.value
+                else:
+                    tool_name = str(tool_call.tool_type or "tool_call")
+                contents.append(
+                    Content.from_function_call(
+                        call_id=call_id,
+                        name=tool_name,
+                        arguments=tool_call.args or {},
+                        informational_only=True,
+                        raw_representation=part,
+                    )
+                )
+            elif part.tool_response is not None:
+                tool_response = part.tool_response
+                contents.append(
+                    Content.from_function_result(
+                        call_id=tool_response.id or self._generate_tool_call_id(),
+                        result=tool_response.response,
+                        raw_representation=part,
+                    )
+                )
             elif part.function_call is not None:
                 function_call = part.function_call
                 if function_call.id:
@@ -810,6 +1147,14 @@ class RawGeminiChatClient(
                 else:
                     call_id = self._generate_tool_call_id()
                     logger.debug("function_call missing id; generated fallback call_id=%r", call_id)
+                # Surface Gemini 3's thought_signature as reasoning content preceding the call so it
+                # survives when the call is later reconstructed without its raw Part.
+                if part.thought_signature is not None:
+                    contents.append(
+                        Content.from_text_reasoning(
+                            protected_data=base64.b64encode(part.thought_signature).decode("utf-8")
+                        )
+                    )
                 contents.append(
                     Content.from_function_call(
                         call_id=call_id,
@@ -855,6 +1200,10 @@ class RawGeminiChatClient(
             details["output_token_count"] = v
         if (v := usage.total_token_count) is not None:
             details["total_token_count"] = v
+        if (v := usage.cached_content_token_count) is not None:
+            details["cache_read_input_token_count"] = v
+        if (v := usage.thoughts_token_count) is not None:
+            details["reasoning_output_token_count"] = v
         return details or None
 
     def _map_finish_reason(self, reason: str | None) -> FinishReasonLiteral | None:
@@ -889,7 +1238,7 @@ class GeminiChatClient(
     RawGeminiChatClient[GeminiChatOptionsT],
     Generic[GeminiChatOptionsT],
 ):
-    """Gemini chat client for the Google Gemini API with function invocation, middleware, and telemetry.
+    """Gemini chat client for Gemini Developer API or Vertex AI with function invocation, middleware, and telemetry.
 
     This is the recommended client for most use cases. It builds on ``RawGeminiChatClient``
     and adds:
@@ -908,6 +1257,10 @@ class GeminiChatClient(
         *,
         api_key: str | None = None,
         model: str | None = None,
+        vertexai: bool | None = None,
+        project: str | None = None,
+        location: str | None = None,
+        credentials: Credentials | None = None,
         env_file_path: str | None = None,
         env_file_encoding: str | None = None,
         client: genai.Client | None = None,
@@ -918,11 +1271,18 @@ class GeminiChatClient(
         """Create a Gemini chat client.
 
         Args:
-            api_key: The Google AI Studio API key. Falls back to ``GEMINI_API_KEY`` environment variable.
-            model: Default model identifier. Falls back to ``GEMINI_MODEL`` environment variable.
+            api_key: Gemini Developer API key. Falls back to environment settings, preferring
+                ``GOOGLE_API_KEY`` over ``GEMINI_API_KEY``.
+            model: Default model identifier. Falls back to environment settings, preferring
+                ``GOOGLE_MODEL`` over ``GEMINI_MODEL``.
+            vertexai: Whether to use Vertex AI endpoints. Falls back to ``GOOGLE_GENAI_USE_VERTEXAI``.
+            project: Google Cloud project ID for Vertex AI. Falls back to ``GOOGLE_CLOUD_PROJECT``.
+            location: Vertex AI location. Falls back to ``GOOGLE_CLOUD_LOCATION``.
+            credentials: Google Cloud credentials for Vertex AI. When omitted, the SDK can use
+                Application Default Credentials.
             env_file_path: Path to a ``.env`` file for credential loading.
             env_file_encoding: Encoding for the ``.env`` file.
-            client: Pre-built ``genai.Client`` instance. When provided, ``api_key`` is not required.
+            client: Pre-built ``genai.Client`` instance. When provided, connector auth settings are not required.
             additional_properties: Extra properties stored on the client instance.
             middleware: Optional middleware chain applied to every call.
             function_invocation_configuration: Optional configuration for the function invocation loop.
@@ -930,6 +1290,10 @@ class GeminiChatClient(
         super().__init__(
             api_key=api_key,
             model=model,
+            vertexai=vertexai,
+            project=project,
+            location=location,
+            credentials=credentials,
             env_file_path=env_file_path,
             env_file_encoding=env_file_encoding,
             client=client,

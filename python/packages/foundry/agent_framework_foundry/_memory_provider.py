@@ -14,13 +14,13 @@ from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from agent_framework import (
-    AGENT_FRAMEWORK_USER_AGENT,
     AgentSession,
     ContextProvider,
     Message,
     SessionContext,
     load_settings,
 )
+from agent_framework._telemetry import get_user_agent
 from azure.ai.projects.aio import AIProjectClient
 from azure.core.credentials import TokenCredential
 from azure.core.credentials_async import AsyncTokenCredential
@@ -49,7 +49,7 @@ class FoundryProjectSettings(TypedDict, total=False):
 class FoundryMemoryProvider(ContextProvider):
     """Foundry Memory context provider using the new ContextProvider hooks pattern.
 
-    Integrates Azure AI Foundry Memory Store for persistent semantic memory,
+    Integrates Microsoft Foundry Memory Store for persistent semantic memory,
     searching and storing memories via the Azure AI Projects SDK.
 
     Args:
@@ -118,8 +118,8 @@ class FoundryMemoryProvider(ContextProvider):
                 raise ValueError("Azure credential is required when project_client is not provided.")
             project_client_kwargs: dict[str, Any] = {
                 "endpoint": resolved_endpoint,
-                "credential": credential,  # type: ignore[arg-type]
-                "user_agent": AGENT_FRAMEWORK_USER_AGENT,
+                "credential": credential,
+                "user_agent": get_user_agent(),
             }
             if allow_preview is not None:
                 project_client_kwargs["allow_preview"] = allow_preview

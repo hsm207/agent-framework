@@ -1,9 +1,10 @@
 # Copyright (c) Microsoft. All rights reserved.
-# ruff: noqa: S404, S603
+# ruff:file-ignore[suspicious-subprocess-import, subprocess-without-shell-equals-true]
 
 """Unified dependency-bound validation entrypoint.
 
 Modes:
+- release: run fast lock-independent lower/upper import probes for changed release packages.
 - test: run workspace-wide compatibility gates at lower and upper resolutions.
 - lower: run lower-bound expansion for one package.
 - upper: run upper-bound expansion for one package.
@@ -28,6 +29,7 @@ from pathlib import Path
 import tomli
 from rich import print
 
+from scripts.dependencies._dependency_bounds_release_impl import run_release_mode
 from scripts.dependencies._dependency_bounds_runtime import (
     extend_command_with_runtime_tools,
     extend_command_with_task,
@@ -50,7 +52,7 @@ class PackageTestPlan:
 
     project_path: Path
     package_name: str
-    include_dev_group: bool
+    dependency_groups: list[str]
     include_dev_extra: bool
     optional_extras: list[str]
     internal_editables: list[Path]
@@ -120,7 +122,7 @@ def _build_test_plans(workspace_root: Path, package_filter: str | None) -> list[
             PackageTestPlan(
                 project_path=project_path,
                 package_name=package_name,
-                include_dev_group="dev" in dependency_groups,
+                dependency_groups=sorted(dependency_groups),
                 include_dev_extra="dev" in optional_dependencies,
                 optional_extras=sorted(name for name in optional_dependencies if name not in {"all", "dev"}),
                 internal_editables=_resolve_internal_editables(package_name, package_map, internal_graph),
@@ -164,8 +166,8 @@ def _run_package_tasks(
             "--quiet",
         ]
         extend_command_with_runtime_tools(command, workspace_root)
-        if plan.include_dev_group:
-            command.extend(["--group", "dev"])
+        for group_name in plan.dependency_groups:
+            command.extend(["--group", group_name])
         if plan.include_dev_extra:
             command.extend(["--extra", "dev"])
         for extra_name in plan.optional_extras:
@@ -257,14 +259,12 @@ def _run_test_mode(
                 timeout_seconds=timeout_seconds,
                 dry_run=dry_run,
             )
-            scenario_result["packages"].append(
-                {
-                    "project_path": str(plan.project_path),
-                    "package_name": plan.package_name,
-                    "status": "passed" if success else "failed",
-                    "error": error,
-                }
-            )
+            scenario_result["packages"].append({
+                "project_path": str(plan.project_path),
+                "package_name": plan.package_name,
+                "status": "passed" if success else "failed",
+                "error": error,
+            })
             if success:
                 print(f"[green]{plan.project_path}: {scenario_name} passed[/green]")
                 continue
@@ -365,15 +365,16 @@ def main() -> None:
     """Parse arguments and run the requested dependency-bound mode."""
     parser = argparse.ArgumentParser(
         description=(
-            "Unified dependency-bound workflow. Use mode=test for workspace-wide lower+upper gates, "
+            "Unified dependency-bound workflow. Use mode=release for fast release sanity probes, "
+            "mode=test for the exhaustive workspace lower+upper matrix, "
             "or lower/upper/both for package-scoped or workspace-wide bound expansion."
         )
     )
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("test", "lower", "upper", "both"),
-        help="Execution mode: test (global) or lower/upper/both (package-scoped).",
+        choices=("release", "test", "lower", "upper", "both"),
+        help="Execution mode: release/test gates or lower/upper/both bound expansion.",
     )
     parser.add_argument(
         "--package",
@@ -424,10 +425,48 @@ def main() -> None:
         default="scripts/dependencies/dependency-bounds-test-results.json",
         help="Output report path for test mode.",
     )
+    parser.add_argument(
+        "--base-ref",
+        default=None,
+        help="Git base used to discover changed package metadata in release mode (required unless --package is set).",
+    )
+    parser.add_argument(
+        "--python",
+        default=None,
+        help="Optional Python override for release probes (defaults to each package closure's requires-python floor).",
+    )
+    parser.add_argument(
+        "--release-timeout-seconds",
+        type=int,
+        default=300,
+        help="Shared wall-clock deadline for all release probes.",
+    )
+    parser.add_argument(
+        "--release-output-json",
+        default="scripts/dependencies/dependency-bounds-release-results.json",
+        help="Output report path for release mode.",
+    )
     args = parser.parse_args()
 
     workspace_root = Path(__file__).resolve().parents[2]
     normalized_package = None if args.package in {None, "", "*"} else args.package
+
+    if args.mode == "release":
+        base_ref = args.base_ref.strip() if args.base_ref else ""
+        python_override = args.python.strip() if args.python else None
+        if not base_ref and normalized_package is None:
+            parser.error("release mode requires --base-ref unless --package selects one package explicitly")
+        exit_code = run_release_mode(
+            workspace_root=workspace_root,
+            base_ref=base_ref or "HEAD",
+            package_filter=normalized_package,
+            parallelism=args.parallelism,
+            python_override=python_override,
+            deadline_seconds=args.release_timeout_seconds,
+            dry_run=args.dry_run,
+            output_json=(workspace_root / args.release_output_json).resolve(),
+        )
+        raise SystemExit(exit_code)
 
     if args.mode == "test":
         exit_code = _run_test_mode(
