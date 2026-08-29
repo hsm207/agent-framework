@@ -7,6 +7,7 @@ import logging
 import shlex
 import sys
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterable,
     Awaitable,
     Callable,
@@ -14,6 +15,7 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from itertools import chain
 from typing import (
@@ -38,13 +40,14 @@ from agent_framework._compaction import (
 )
 from agent_framework._middleware import ChatAndFunctionMiddlewareTypes, ChatMiddlewareLayer
 from agent_framework._settings import SecretString
-from agent_framework._telemetry import USER_AGENT_KEY
+from agent_framework._telemetry import USER_AGENT_KEY, mark_feature_used
 from agent_framework._tools import (
     SHELL_TOOL_KIND_VALUE,
     FunctionInvocationConfiguration,
     FunctionInvocationLayer,
     FunctionTool,
     ToolTypes,
+    _is_hosted_tool_approval,  # pyright: ignore[reportPrivateUsage]
     normalize_tools,
     tool,
 )
@@ -62,7 +65,6 @@ from agent_framework._types import (
     TextSpanRegion,
     UsageDetails,
     detect_media_type_from_base64,
-    prepend_instructions_to_messages,
     validate_tool_mode,
 )
 from agent_framework.exceptions import (
@@ -92,6 +94,7 @@ from openai.types.responses.web_search_tool_param import WebSearchToolParam
 from pydantic import BaseModel
 
 from ._exceptions import OpenAIContentFilterException
+from ._feature_usage import FeatureIndex
 from ._shared import (
     AzureTokenProvider,
     _attach_prompt_cache_breakpoint,  # pyright: ignore[reportPrivateUsage]
@@ -294,6 +297,51 @@ OpenAIChatOptionsT = TypeVar(
 # region Helpers
 
 
+@asynccontextmanager
+async def _open_event_stream(raw_response: Any) -> AsyncGenerator[Any]:
+    """Yield the event stream for a raw streaming response.
+
+    Normally ``raw_response`` is the SDK's raw-response wrapper, whose ``.parse()``
+    returns the event stream as an async context manager so the underlying socket is
+    closed deterministically.
+
+    A telemetry instrumentor can replace that wrapper with one of its own that is
+    itself the async iterator and exposes neither ``.parse()`` nor ``.headers`` -- for
+    example the ``AsyncStreamWrapper`` installed by ``azure-ai-projects`` when
+    ``AZURE_EXPERIMENTAL_ENABLE_GENAI_TRACING`` is enabled. That wrapper still holds
+    the unparsed raw response (its ``stream_async_iter``), because
+    ``with_raw_response.create()`` routes through the instrumented ``create``.
+
+    Parse that inner raw response and hand it back to the wrapper, so the wrapper
+    stays in the iteration path and keeps recording telemetry while we iterate real
+    events. Iterating the wrapper as-is would fail, since the unparsed raw response
+    is not an async iterator.
+
+    Args:
+        raw_response: The object returned by a ``with_raw_response`` streaming call.
+
+    Yields:
+        The object to iterate for streaming events.
+    """
+    parse = getattr(raw_response, "parse", None)
+    if callable(parse):
+        async with cast("Any", parse()) as stream:
+            yield stream
+        return
+
+    # Telemetry wrapper: parse the raw response it wraps, in place.
+    inner = getattr(raw_response, "stream_async_iter", None)
+    inner_parse = getattr(inner, "parse", None)
+    if callable(inner_parse):
+        async with cast("Any", inner_parse()) as stream:
+            raw_response.stream_async_iter = stream
+            yield raw_response
+        return
+
+    # Already an event stream (or an unrecognized wrapper): iterate it directly.
+    yield raw_response
+
+
 def _annotations_to_output_text(annotations: Sequence[Annotation] | None) -> list[dict[str, Any]]:
     """Convert framework `Annotation` objects to Responses API `output_text` annotation dicts.
 
@@ -395,6 +443,7 @@ class RawOpenAIChatClient(
     INJECTABLE: ClassVar[set[str]] = {"client"}
     STORES_BY_DEFAULT: ClassVar[bool] = True
     SUPPORTS_RICH_FUNCTION_OUTPUT: ClassVar[bool] = True
+    _FEATURE_USAGE_INDEX: ClassVar[int | None] = FeatureIndex.OPENAI
 
     # Azure OpenAI Responses API may include this header in responses naming the actual model that
     # served the request (e.g. ``gpt-5-nano-2025-08-07``), which can differ from the deployment alias
@@ -625,6 +674,8 @@ class RawOpenAIChatClient(
             Tuple of (client, run_options, validated_options).
         """
         client = self.client
+        if self._FEATURE_USAGE_INDEX is not None:
+            mark_feature_used(self._FEATURE_USAGE_INDEX)
         validated_options = await self._validate_options(options)
         run_options = await self._prepare_options(messages, validated_options)
         return client, run_options, validated_options
@@ -654,6 +705,7 @@ class RawOpenAIChatClient(
         **kwargs: Any,
     ) -> Awaitable[ChatResponse] | ResponseStream[ChatResponseUpdate, ChatResponse]:
         continuation_token: OpenAIContinuationToken | None = options.get("continuation_token")
+        extra_headers = cast("Mapping[str, Any] | None", kwargs.get("extra_headers"))
 
         if stream:
             function_call_ids: dict[int, tuple[str, str]] = {}
@@ -674,19 +726,22 @@ class RawOpenAIChatClient(
                 if continuation_token is not None:
                     # Resume a background streaming response by retrieving with stream=True
                     client = self.client
+                    if self._FEATURE_USAGE_INDEX is not None:
+                        mark_feature_used(self._FEATURE_USAGE_INDEX)
                     validated_options = await self._validate_options(options)
                     response_format = validated_options.get("response_format")
                     try:
                         raw_stream_response = await client.responses.with_raw_response.retrieve(
                             continuation_token["response_id"],
                             stream=True,
+                            extra_headers=extra_headers,
                         )
                         # Read headers defensively: telemetry instrumentors (e.g. azure-ai-projects
                         # experimental tracing) wrap the streaming response in objects that do not
                         # proxy ``.headers``. Degrade gracefully so the served-model surfacing is
                         # best-effort instead of crashing the whole call.
                         served_model = self._extract_served_model(getattr(raw_stream_response, "headers", None))
-                        async with raw_stream_response.parse() as stream_response:
+                        async with _open_event_stream(raw_stream_response) as stream_response:
                             async for chunk in stream_response:
                                 update = self._parse_chunk_from_openai(
                                     chunk,
@@ -705,6 +760,8 @@ class RawOpenAIChatClient(
                         run_options,
                         validated_options,
                     ) = await self._prepare_request(messages, options)
+                    if extra_headers is not None:
+                        run_options["extra_headers"] = dict(extra_headers)
                     response_format = validated_options.get("response_format")
                     try:
                         if "text_format" in run_options:
@@ -728,7 +785,7 @@ class RawOpenAIChatClient(
                             )
                             # See note above on ``raw_stream_response.headers``.
                             served_model = self._extract_served_model(getattr(raw_create_response, "headers", None))
-                            async with raw_create_response.parse() as stream_response:
+                            async with _open_event_stream(raw_create_response) as stream_response:
                                 async for chunk in stream_response:
                                     update = self._parse_chunk_from_openai(
                                         chunk,
@@ -749,9 +806,14 @@ class RawOpenAIChatClient(
             if continuation_token is not None:
                 # Poll a background response by retrieving without stream
                 client = self.client
+                if self._FEATURE_USAGE_INDEX is not None:
+                    mark_feature_used(self._FEATURE_USAGE_INDEX)
                 validated_options = await self._validate_options(options)
                 try:
-                    raw_response = await client.responses.with_raw_response.retrieve(continuation_token["response_id"])
+                    raw_response = await client.responses.with_raw_response.retrieve(
+                        continuation_token["response_id"],
+                        extra_headers=extra_headers,
+                    )
                     response = raw_response.parse()
                 except Exception as ex:
                     self._handle_request_error(ex)
@@ -770,6 +832,8 @@ class RawOpenAIChatClient(
                     options.pop("continuation_token", None)
                 return chat_response
             client, run_options, validated_options = await self._prepare_request(messages, options)
+            if extra_headers is not None:
+                run_options["extra_headers"] = dict(extra_headers)
             try:
                 if "text_format" in run_options:
                     raw_response = await client.responses.with_raw_response.parse(stream=False, **run_options)
@@ -1377,7 +1441,6 @@ class RawOpenAIChatClient(
             "logit_bias",  # not supported
             "seed",  # not supported
             "stop",  # not supported
-            "instructions",  # already added as system message
             "response_format",  # handled separately
             "conversation_id",  # handled separately
             "tool_choice",  # handled separately
@@ -1389,15 +1452,6 @@ class RawOpenAIChatClient(
             raise ChatClientInvalidRequestException(
                 "prompt_cache_options requires openai>=2.45.0; upgrade the openai package to use it."
             )
-
-        # messages
-        # Handle instructions by prepending to messages as system message
-        # Only prepend instructions for the first turn (when no conversation/response ID exists)
-        conversation_id = options.get("conversation_id")
-        if (instructions := options.get("instructions")) and not conversation_id:
-            # First turn: prepend instructions as system message
-            messages = prepend_instructions_to_messages(list(messages), instructions, role="system")
-        # Continuation turn: instructions already exist in conversation context, skip prepending
         request_uses_service_side_storage = False
         for key in ("conversation_id", "previous_response_id", "conversation"):
             value = options.get(key)
@@ -1695,8 +1749,22 @@ class RawOpenAIChatClient(
                     )
                     if function_call:
                         all_messages.append(function_call)
-                case "function_approval_response" | "function_approval_request":
-                    if request_uses_service_side_storage:
+                case "function_approval_request":
+                    # Service-stored hosted requests are already present remotely, and local approvals
+                    # are resolved in-process; neither should be serialized as an MCP input item.
+                    if request_uses_service_side_storage or not _is_hosted_tool_approval(content):
+                        continue
+                    prepared = self._prepare_content_for_openai(
+                        message.role,
+                        content,
+                        replays_local_storage=replays_local_storage,
+                    )
+                    if prepared:
+                        all_messages.append(prepared)
+                case "function_approval_response":
+                    # Local approvals are resolved in-process; only hosted decisions have a matching
+                    # MCP approval request on the provider and should be serialized.
+                    if not _is_hosted_tool_approval(content):
                         continue
                     prepared = self._prepare_content_for_openai(
                         message.role,
@@ -3382,6 +3450,10 @@ class RawOpenAIChatClient(
             total_token_count=usage.total_tokens,
         )
         if usage.input_tokens_details:
+            cache_write_tokens = cast("int | None", getattr(usage.input_tokens_details, "cache_write_tokens", None))
+            if cache_write_tokens is not None:
+                details["openai.cache_write_tokens"] = cache_write_tokens
+                details["cache_creation_input_token_count"] = cache_write_tokens
             cached_tokens = cast("int | None", getattr(usage.input_tokens_details, "cached_tokens", None))
             if cached_tokens is not None:
                 details["openai.cached_input_tokens"] = cached_tokens

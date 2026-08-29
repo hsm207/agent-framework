@@ -8,6 +8,7 @@ import os
 import sys
 import warnings
 from contextlib import _AsyncGeneratorContextManager  # type: ignore
+from contextvars import ContextVar
 from datetime import timedelta
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -4744,6 +4745,52 @@ async def test_mcp_tool_call_tool_requires_loaded_tools() -> None:
         await tool.call_tool("remote_tool")
 
 
+async def test_generated_mcp_function_ignores_model_supplied_remote_tool_name() -> None:
+    """A model-supplied argument must not be able to redirect the call to another remote tool."""
+    tool = MCPTool(name="test_tool")  # type: ignore[abstract]
+    tool.session = Mock(spec=ClientSession)
+    tool.session.list_tools = AsyncMock(  # ty: ignore[unresolved-attribute]
+        return_value=types.ListToolsResult(
+            tools=[
+                types.Tool(
+                    name="search_docs",
+                    description="Search docs.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                ),
+                types.Tool(
+                    name="delete_repo",
+                    description="Delete a repository.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"repo": {"type": "string"}},
+                        "required": ["repo"],
+                    },
+                ),
+            ]
+        )
+    )
+    tool.session.call_tool = AsyncMock(  # ty: ignore[unresolved-attribute]
+        return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+    )
+
+    await tool.load_tools()
+
+    search_docs = next(func for func in tool.functions if func.name == "search_docs")
+    await search_docs.invoke(
+        arguments={"query": "quarterly report", "_remote_tool_name": "delete_repo", "repo": "corp/prod"}
+    )
+
+    tool.session.call_tool.assert_awaited_once()  # ty: ignore[unresolved-attribute]
+    await_args = tool.session.call_tool.await_args  # ty: ignore[unresolved-attribute]
+    assert await_args is not None
+    assert await_args.args[0] == "search_docs"
+    assert await_args.kwargs["arguments"] == {"query": "quarterly report"}
+
+
 async def test_mcp_tool_get_prompt_requires_loaded_prompts() -> None:
     tool = MCPTool(name="test_tool", load_prompts=False)  # type: ignore[abstract]
 
@@ -6023,6 +6070,187 @@ async def test_mcp_streamable_http_tool_header_provider_with_httpx_event_hook():
                 _mcp_call_headers.reset(token)
     finally:
         # Ensure any created httpx client is properly closed
+        if getattr(tool, "_httpx_client", None) is not None:
+            await tool._httpx_client.aclose()  # type: ignore[union-attr]
+
+
+async def test_mcp_streamable_http_tool_header_provider_injects_on_ambient_request():
+    """Regression test for #7079: static header_provider must authenticate ambient requests.
+
+    The initialize handshake, load_tools/load_prompts discovery, and background pings run
+    outside call_tool, so the contextvar/snapshot are unset. A static header_provider should
+    still be invoked (with empty kwargs) so these requests carry auth headers.
+    """
+    import httpx
+
+    tool = MCPStreamableHTTPTool(
+        name="test",
+        url="http://example.com/mcp",
+        header_provider=lambda kw: {"Authorization": "******"},
+    )
+
+    try:
+        with patch("agent_framework._mcp.streamable_http_client"):
+            tool.get_mcp_client()
+
+            assert tool._httpx_client is not None
+            hooks = tool._httpx_client.event_hooks.get("request", [])
+            assert len(hooks) == 1
+
+            # No contextvar set and no active call snapshot: simulates the initialize handshake.
+            request = httpx.Request("POST", "http://example.com/mcp")
+            await hooks[0](request)
+            assert request.headers.get("Authorization") == "******"
+    finally:
+        if getattr(tool, "_httpx_client", None) is not None:
+            await tool._httpx_client.aclose()  # type: ignore[union-attr]
+
+
+async def test_mcp_streamable_http_tool_header_provider_ambient_request_tolerates_kwargs_provider():
+    """A header_provider that requires per-call kwargs must not crash ambient requests.
+
+    Providers that index runtime kwargs (e.g. kw["mcp_api_key"]) which are absent at connect
+    time raise KeyError. The hook should swallow that specific error and proceed without headers
+    rather than failing the initialize handshake.
+    """
+    import httpx
+
+    tool = MCPStreamableHTTPTool(
+        name="test",
+        url="http://example.com/mcp",
+        header_provider=lambda kw: {"Authorization": f"Bearer {kw['mcp_api_key']}"},
+    )
+
+    try:
+        with patch("agent_framework._mcp.streamable_http_client"):
+            tool.get_mcp_client()
+
+            assert tool._httpx_client is not None
+            hooks = tool._httpx_client.event_hooks.get("request", [])
+            assert len(hooks) == 1
+
+            # No kwargs available at connect time -> provider raises KeyError -> hook swallows it.
+            request = httpx.Request("POST", "http://example.com/mcp")
+            await hooks[0](request)
+            assert "Authorization" not in request.headers
+    finally:
+        if getattr(tool, "_httpx_client", None) is not None:
+            await tool._httpx_client.aclose()  # type: ignore[union-attr]
+
+
+async def test_mcp_streamable_http_tool_header_provider_empty_active_call_skips_ambient_fallback():
+    """Regression test: an active call that yields no headers must not trigger the ambient fallback.
+
+    When header_provider legitimately returns {} for a real call_tool invocation, the empty dict
+    is a valid "set" value. The hook must treat it as set-but-empty (leave the request unchanged)
+    rather than as "unset", which would re-invoke header_provider({}) mid-call and inject headers
+    the caller deliberately omitted.
+    """
+    import httpx
+
+    from agent_framework._mcp import _mcp_call_headers
+
+    call_count = 0
+
+    def provider(kw: dict[str, Any]) -> dict[str, str]:
+        nonlocal call_count
+        call_count += 1
+        # Non-empty for ambient ({}), empty for the active call below.
+        return {} if kw.get("suppress") else {"Authorization": "******"}
+
+    tool = MCPStreamableHTTPTool(name="test", url="http://example.com/mcp", header_provider=provider)
+
+    try:
+        with patch("agent_framework._mcp.streamable_http_client"):
+            tool.get_mcp_client()
+
+            assert tool._httpx_client is not None
+            hooks = tool._httpx_client.event_hooks.get("request", [])
+            assert len(hooks) == 1
+
+            # Simulate an active call whose provider returned {} (both ContextVar and snapshot set).
+            token = _mcp_call_headers.set({})
+            tool._active_call_headers = {}
+            try:
+                call_count = 0
+                request = httpx.Request("POST", "http://example.com/mcp")
+                await hooks[0](request)
+                assert "Authorization" not in request.headers
+                assert call_count == 0, "ambient fallback must not run during a set-but-empty call"
+            finally:
+                tool._active_call_headers = None
+                _mcp_call_headers.reset(token)
+    finally:
+        if getattr(tool, "_httpx_client", None) is not None:
+            await tool._httpx_client.aclose()  # type: ignore[union-attr]
+
+
+async def test_mcp_streamable_http_tool_header_provider_ambient_kwarg_error_is_benign(caplog):
+    """A kwargs-dependent provider that raises KeyError on ambient requests must not fail them.
+
+    Ambient requests (initialize/discovery plus recurring pings) call the provider with empty
+    kwargs, so a provider indexing a required per-call kwarg raises KeyError. That is tolerated:
+    the request proceeds without headers and only a DEBUG line is logged (no WARNING spam).
+    """
+    import logging
+
+    import httpx
+
+    tool = MCPStreamableHTTPTool(
+        name="test",
+        url="http://example.com/mcp",
+        header_provider=lambda kw: {"Authorization": "Bearer " + kw["mcp_api_key"]},
+    )
+
+    try:
+        with patch("agent_framework._mcp.streamable_http_client"):
+            tool.get_mcp_client()
+
+            assert tool._httpx_client is not None
+            hooks = tool._httpx_client.event_hooks.get("request", [])
+            assert len(hooks) == 1
+
+            with caplog.at_level(logging.DEBUG, logger="agent_framework._mcp"):
+                for _ in range(3):
+                    request = httpx.Request("POST", "http://example.com/mcp")
+                    await hooks[0](request)
+                    assert "Authorization" not in request.headers
+
+            # The benign kwargs case must not escalate to WARNING/ERROR.
+            assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    finally:
+        if getattr(tool, "_httpx_client", None) is not None:
+            await tool._httpx_client.aclose()  # type: ignore[union-attr]
+
+
+async def test_mcp_streamable_http_tool_header_provider_ambient_non_keyerror_propagates():
+    """A genuine header_provider failure on an ambient request must surface, not be swallowed.
+
+    Only the missing-kwargs case (KeyError) is tolerated. Any other error - e.g. a token-refresh
+    failure or a provider bug - propagates so it is not silently converted into unauthenticated
+    traffic, matching the call_tool path which does not catch header_provider exceptions.
+    """
+    import httpx
+
+    class TokenRefreshError(RuntimeError):
+        pass
+
+    def failing_provider(kw: dict[str, Any]) -> dict[str, str]:
+        raise TokenRefreshError("token endpoint unreachable")
+
+    tool = MCPStreamableHTTPTool(name="test", url="http://example.com/mcp", header_provider=failing_provider)
+
+    try:
+        with patch("agent_framework._mcp.streamable_http_client"):
+            tool.get_mcp_client()
+
+            assert tool._httpx_client is not None
+            hooks = tool._httpx_client.event_hooks.get("request", [])
+            assert len(hooks) == 1
+
+            with pytest.raises(TokenRefreshError):
+                await hooks[0](httpx.Request("POST", "http://example.com/mcp"))
+    finally:
         if getattr(tool, "_httpx_client", None) is not None:
             await tool._httpx_client.aclose()  # type: ignore[union-attr]
 
@@ -7631,7 +7859,7 @@ def test_prepare_call_kwargs_rejects_invalid_meta_key_names(key: str) -> None:
 
 
 async def test_call_tool_forwards_only_declared_arguments() -> None:
-    """End-to-end: framework runtime kwargs are stripped before reaching the server."""
+    """End-to-end: runtime kwargs the tool does not declare are stripped before reaching the server."""
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
@@ -7673,6 +7901,130 @@ async def test_call_tool_forwards_only_declared_arguments() -> None:
         session_mock.call_tool.assert_called_once()  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
         _, call_kwargs = session_mock.call_tool.call_args  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
         assert call_kwargs["arguments"] == {"param": "value", "conversation_id": "c"}
+
+
+async def test_call_tool_forwards_runtime_kwargs_the_server_declares() -> None:
+    """A runtime kwarg is forwarded when the server declares a property of the same name.
+
+    Invokes the generated ``FunctionTool`` with a ``FunctionInvocationContext`` so the merge in
+    ``_call_tool_with_runtime_kwargs`` is on the tested path: the model supplies only ``param``,
+    while ``api_token`` arrives solely through ``FunctionInvocationContext.kwargs``. The allowlist
+    in ``_prepare_call_kwargs`` is built from the server's advertised ``inputSchema.properties``,
+    so declaring an optional property is enough for the server to receive that runtime value,
+    without the name appearing in ``additional_tool_argument_names``. This pins the behavior the
+    ``function_invocation_kwargs`` guidance describes.
+    """
+
+    class TestServer(MCPTool):
+        async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
+            self.session = Mock(spec=ClientSession)
+            self.session.list_tools = AsyncMock(
+                return_value=types.ListToolsResult(
+                    tools=[
+                        types.Tool(
+                            name="test_tool",
+                            description="Test tool",
+                            inputSchema={
+                                "type": "object",
+                                "properties": {
+                                    "param": {"type": "string"},
+                                    # Declared but not required, so the model never supplies it.
+                                    "api_token": {"type": "string"},
+                                },
+                                "required": ["param"],
+                            },
+                        )
+                    ]
+                )
+            )
+            self.session.call_tool = AsyncMock(
+                return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+            )
+
+        def get_mcp_client(self) -> _AsyncGeneratorContextManager[Any, None]:
+            return None  # type: ignore[return-value]  # pyrefly: ignore[bad-return]  # ty: ignore[invalid-return-type]
+
+    server = TestServer(name="test_server")
+    async with server:
+        await server.load_tools()
+        session_mock = server.session
+
+        # Invoke the generated FunctionTool the way the function-calling loop does, so the
+        # runtime kwargs are merged by _call_tool_with_runtime_kwargs rather than being passed
+        # to call_tool directly. Only "param" is model-supplied.
+        tool = next(f for f in server.functions if f.name == "test_tool")
+        context = FunctionInvocationContext(
+            function=tool,
+            arguments={"param": "value"},
+            kwargs={"api_token": "runtime-value"},
+        )
+        await tool.invoke(arguments={"param": "value"}, context=context)
+
+        _, call_kwargs = session_mock.call_tool.call_args  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+        assert call_kwargs["arguments"] == {"param": "value", "api_token": "runtime-value"}
+
+
+async def test_header_provider_reading_contextvar_keeps_credential_out_of_arguments() -> None:
+    """A credential sourced outside ``function_invocation_kwargs`` is not exposed to the filter.
+
+    Documents the pattern the ``header_provider`` guidance recommends: the provider reads a
+    ``ContextVar`` instead of its ``kwargs`` argument, so the credential never enters the runtime
+    kwargs and cannot be forwarded as a tool argument even though the server declares a property
+    of that name. The value still varies per request.
+    """
+    token_var: ContextVar[str] = ContextVar("test_token_var")
+    seen_headers: list[dict[str, str]] = []
+
+    class TestServer(MCPStreamableHTTPTool):
+        async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
+            self.session = Mock(spec=ClientSession)
+            self.session.list_tools = AsyncMock(
+                return_value=types.ListToolsResult(
+                    tools=[
+                        types.Tool(
+                            name="get_weather",
+                            description="Weather",
+                            inputSchema={
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}, "api_key": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        )
+                    ]
+                )
+            )
+            self.session.call_tool = AsyncMock(
+                return_value=types.CallToolResult(content=[types.TextContent(type="text", text="sunny")])
+            )
+            self.session.send_ping = AsyncMock()
+            self.is_connected = True
+
+        def get_mcp_client(self):  # pyrefly: ignore[bad-override]
+            return None
+
+    def provider(_kwargs: dict[str, Any]) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {token_var.get()}"}
+        seen_headers.append(headers)
+        return headers
+
+    server = TestServer(name="test_server", url="http://example.com/mcp", header_provider=provider)
+    async with server:
+        await server.load_tools()
+        tool = next(f for f in server.functions if f.name == "get_weather")
+
+        token_var.set("secret-1")
+        context = FunctionInvocationContext(function=tool, arguments={"city": "Seattle"}, kwargs={})
+        await tool.invoke(arguments={"city": "Seattle"}, context=context)
+
+        _, call_kwargs = server.session.call_tool.call_args  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+        assert seen_headers[-1] == {"Authorization": "Bearer secret-1"}
+        assert call_kwargs["arguments"] == {"city": "Seattle"}
+
+        # The same provider yields a different credential on the next request.
+        token_var.set("secret-2")
+        context = FunctionInvocationContext(function=tool, arguments={"city": "Oslo"}, kwargs={})
+        await tool.invoke(arguments={"city": "Oslo"}, context=context)
+        assert seen_headers[-1] == {"Authorization": "Bearer secret-2"}
 
 
 # endregion

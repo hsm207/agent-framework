@@ -207,6 +207,10 @@ temp*/
 
 # AI
 **/.checkpoints/
+# Local AgentServer file store + crash-recovery HOME roots used by hosted samples
+**/.agentserver-state/
+**/.agentserver-state-*/
+**/.home-*/
 .claude/
 .omc/
 .omx/
@@ -249,6 +253,9 @@ dotnet/filtered-*.slnx
 # .NET Build Artifacts
 **/obj/
 **/bin/
+
+# Local .NET build overrides
+/dotnet/Directory.Build.rsp
 
 # Local tool state
 .omc/
